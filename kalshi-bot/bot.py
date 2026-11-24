@@ -366,8 +366,13 @@ def hhmmss(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M:%S")
 
 
-def usd(cents: float) -> str:
-    return f"{'-' if cents < 0 else ''}${abs(cents) / 100:,.2f}"
+def cents(p: float | None) -> str:
+    """Price for display: whole cents, or one decimal in Kalshi's sub-cent zones."""
+    return "--" if p is None else f"{p:.1f}".rstrip("0").rstrip(".")
+
+
+def usd(c: float) -> str:
+    return f"{'-' if c < 0 else ''}${abs(c) / 100:,.2f}"
 
 
 class Bot:
@@ -686,8 +691,7 @@ class Bot:
 
     def _status(self, mkt: Market, book: Book, sig: dict | None, now: float):
         def q(side):
-            b, a = book.best_bid(side), book.best_ask(side)
-            return f"{'--' if b is None else f'{b:.0f}'}/{'--' if a is None else f'{a:.0f}'}"
+            return f"{cents(book.best_bid(side))}/{cents(book.best_ask(side))}"
         left = max(0, int(mkt.close_ts - now))
         line = f"T-{left // 60:02d}:{left % 60:02d}  UP {q('yes')}  DOWN {q('no')}"
         if sig:
@@ -698,7 +702,7 @@ class Bot:
             bid = book.best_bid(pos.side)
             target = self._target(pos)
             line += (f"  | LONG {pos.qty} {'UP' if pos.side == 'yes' else 'DOWN'} @ {pos.entry_price:.1f}c"
-                     f", bid {'--' if bid is None else f'{bid:.0f}'}c"
+                     f", bid {cents(bid)}c"
                      + (f", sells at {target:.0f}c" if target else ""))
         else:
             line += f"  | flat, cash {usd(self.cash_c)}"
