@@ -622,6 +622,8 @@ class Bot:
             # position, and at OUR price (not the higher bid), at the resting-order fee.
             qty = filled(sim_sell(book, pos.side, pos.qty, target, 0.0))
             fills = [Fill(target, qty, fee_cents(self.maker_rate, qty, target))] if qty == pos.qty else []
+            depth = sum(q for p, q in book.bids(pos.side) if p >= target - EPS)
+            why = f"profit (book showed {depth:,} bid at {cents(target)}c or better, best {cents(book.best_bid(pos.side))}c)"
         else:
             # Marketable order: wait out the latency, then hit whatever bids are really
             # there, keeping only the part that is still profitable after the taker fee.
@@ -629,7 +631,8 @@ class Bot:
             fills = sim_sell(self.kalshi.orderbook(mkt.ticker), pos.side, pos.qty, target, self.rate)
             while fills and gross(fills) - fees(fills) < filled(fills) * (pos.avg_cost + self.cfg.min_profit) - EPS:
                 fills.pop()
-        self._book_sale(pos, fills, now, "SELL", "profit")
+            why = "profit"
+        self._book_sale(pos, fills, now, "SELL", why)
 
     def _dump(self, pos: Position, mkt: Market, now: float, action: str, why: str):
         """Get out now: marketable order against the real bids, taker fee."""
