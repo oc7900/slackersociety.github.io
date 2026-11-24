@@ -1126,7 +1126,7 @@ def parse_args(argv=None):
     ap.add_argument("--max-entries", type=int, default=3, help="max round trips per window")
     ap.add_argument("--cooldown", type=float, default=20.0, help="seconds to wait after an exit")
     ap.add_argument("--poll", type=float, default=1.0, help="seconds between order-book checks")
-    ap.add_argument("--latency-ms", type=float, default=150.0,
+    ap.add_argument("--latency-ms", type=float, default=300.0,
                     help="simulated delay between deciding and the order reaching the book")
     ap.add_argument("--status-every", type=float, default=15.0, help="seconds between status lines")
     ap.add_argument("--minutes", type=float, default=0.0, help="stop after N minutes (0 = run until Ctrl-C)")

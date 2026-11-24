@@ -508,10 +508,26 @@ class Backtest(unittest.TestCase):
         late = self.bars([50] * 8 + [30] * 7)                            # in range only from minute 9
         self.assertIsNone(self.bt.replay_window(self.m, late, {}, self.a, "blind", "first"))
 
-    def test_history_prices_parse_from_dollars_or_cents(self):
-        self.assertAlmostEqual(self.bt.cents("0.4300"), 43.0)
-        self.assertAlmostEqual(self.bt.cents(43), 43.0)
-        self.assertIsNone(self.bt.cents(None))
+    def test_parses_kalshi_minute_candles(self):
+        # two real candles (2026-11-24, trimmed) plus one that belongs to the next window
+        m = {"ticker": "T", "open": 1795517100.0, "close": 1795518000.0, "strike": 1.0, "result": "yes"}
+        candles = [
+            {"end_period_ts": 1795517160,
+             "yes_ask": {"close_dollars": "0.3500", "high_dollars": "0.9990", "low_dollars": "0.3300", "open_dollars": "0.9990"},
+             "yes_bid": {"close_dollars": "0.3400", "high_dollars": "0.5200", "low_dollars": "0.0000", "open_dollars": "0.0000"}},
+            {"end_period_ts": 1795517220,
+             "yes_ask": {"close_dollars": "0.3400", "high_dollars": "0.4500", "low_dollars": "0.3300", "open_dollars": "0.3500"},
+             "yes_bid": {"close_dollars": "0.3300", "high_dollars": "0.4400", "low_dollars": "0.3200", "open_dollars": "0.3400"}},
+            {"end_period_ts": 1795518060, "yes_ask": {"close_dollars": "0.5000", "low_dollars": "0.5"},
+             "yes_bid": {"close_dollars": "0.4900", "high_dollars": "0.5"}},
+        ]
+        bars = self.bt.parse_bars(candles, m)
+        self.assertEqual(len(bars), 2)
+        self.assertEqual(bars[0], {"end": 1795517160, "bid": 34.0, "ask": 35.0, "bid_high": 52.0, "ask_low": 33.0})
+        # UP offered at 35c after minute 1 -> bought; minute 2's best bid of 44c fills the resting sell
+        pnl, won, entry = self.bt.replay_window(m, bars, {}, self.a, "blind", "first")
+        self.assertTrue(won)
+        self.assertEqual(entry, 35.0)
 
 
 if __name__ == "__main__":

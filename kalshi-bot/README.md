@@ -94,7 +94,7 @@ being above zero. Give it at least a day of recording (about 100 windows).
 
 - Buys lift the real resting offers, level by level, and never take more
   contracts than are actually displayed. Whole contracts only.
-- A buy is a limit order placed *after* a simulated 150 ms delay, against a
+- A buy is a limit order placed *after* a simulated 300 ms delay, against a
   freshly fetched book. If the offer is gone by then, there is no fill.
 - Kalshi's taker fee, `0.07 x contracts x P x (1 - P)` rounded up to the cent,
   is charged on every buy (the rate is read from Kalshi's series record).
