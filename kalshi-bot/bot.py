@@ -56,6 +56,7 @@ SPOT_PRODUCT = {
 }
 
 DEFAULT_FEE_RATE = 0.07   # Kalshi general taker fee: 0.07 * contracts * P * (1 - P)
+MAKER_FEE_RATE = 0.0175   # resting orders: only on series flagged "quadratic_with_maker_fees"
 MIN_SIGMA_1M = 0.00015    # floor on 1-minute volatility so the model is never over-confident
 EPS = 1e-9
 
@@ -119,6 +120,7 @@ class Market:
     strike: float | None          # "price to beat"; None if Kalshi does not publish one
     status: str
     result: str                   # "yes" / "no" once settled, else ""
+    strike_live: bool = False     # strike confirmed from the live (uncached) endpoint
 
     @classmethod
     def from_api(cls, m: dict) -> "Market":
@@ -186,16 +188,17 @@ class Kalshi:
     def __init__(self, base: str = KALSHI_API):
         self.base = base
 
-    def fee_rate(self, series: str) -> float:
-        """Taker fee coefficient for the series (falls back to the general 7%)."""
+    def fee_rates(self, series: str) -> tuple[float, float]:
+        """(taker, maker) fee coefficients for the series, from Kalshi's own series
+        record. Falls back to the general schedule (7% taker) if it cannot be read."""
         try:
             s = http_get(f"{self.base}/series/{series}").get("series") or {}
         except FeedError:
-            return DEFAULT_FEE_RATE
+            return DEFAULT_FEE_RATE, 0.0
         mult = _num(s.get("fee_multiplier"))
-        if "quadratic" in (s.get("fee_type") or "quadratic") and mult and 0 < mult <= 3:
-            return DEFAULT_FEE_RATE * mult
-        return DEFAULT_FEE_RATE
+        mult = mult if mult and 0 < mult <= 3 else 1.0
+        maker = MAKER_FEE_RATE * mult if "maker" in (s.get("fee_type") or "") else 0.0
+        return DEFAULT_FEE_RATE * mult, maker
 
     def open_markets(self, series: str) -> list[Market]:
         data = http_get(f"{self.base}/markets",
@@ -370,7 +373,7 @@ def usd(cents: float) -> str:
 class Bot:
     def __init__(self, cfg, kalshi: Kalshi, spot: Spot, clock=time, out=print):
         self.cfg, self.kalshi, self.spot, self.clock, self.out = cfg, kalshi, spot, clock, out
-        self.rate = DEFAULT_FEE_RATE
+        self.rate, self.maker_rate = DEFAULT_FEE_RATE, 0.0
         self.cash_c = cfg.bankroll * 100.0
         self.start_cash_c = self.cash_c
         self.positions: dict[str, Position] = {}
@@ -437,9 +440,10 @@ class Bot:
 
     def run(self):
         cfg = self.cfg
-        self.rate = self.kalshi.fee_rate(cfg.series)
-        self.out(f"PAPER TRADING {cfg.series} | bankroll {usd(self.cash_c)} | stake {usd(cfg.stake * 100)}/trade"
-                 f" | taker fee {self.rate:.3f}*C*P*(1-P) | no real orders are ever sent")
+        self.rate, self.maker_rate = self.kalshi.fee_rates(cfg.series)
+        self.out(f"PAPER TRADING {cfg.series} | cash {usd(self.cash_c)} | stake {usd(cfg.stake * 100)}/trade"
+                 f" | fees: taker {self.rate:.3f}*C*P*(1-P), resting {self.maker_rate:.4f}"
+                 f" | exit by {cfg.exit} order | no real orders are ever sent")
         started = self.clock.time()
         while not self.stop:
             t0 = self.clock.time()
@@ -520,11 +524,15 @@ class Bot:
                 self._strike_note = mkt.ticker
                 self.log("    joined this window part-way through: watching only, trading starts next window")
             return (None, 0.0)
-        if not mkt.strike and now - mkt.open_ts < 30:
-            if now - self._strike_poll >= 2:             # the strike is published moments after the open
-                self._strike_poll = now
-                mkt.strike = self.kalshi.market(mkt.ticker).strike
-            if not mkt.strike:
+        if not mkt.strike_live:
+            # The market list is cached for ~15s and the strike is only set moments
+            # after the open, so read it from the live single-market endpoint.
+            if now - self._strike_poll < 2:
+                return (None, 0.0)
+            self._strike_poll = now
+            mkt.strike = self.kalshi.market(mkt.ticker).strike
+            mkt.strike_live = bool(mkt.strike) or now - mkt.open_ts > 30
+            if not mkt.strike_live:
                 return (None, 0.0)
         strike = mkt.strike or ours                      # series with no published strike: spot at the open
         basis = strike - ours
@@ -569,10 +577,13 @@ class Bot:
         pos = Position(mkt.ticker, side, qty, cost, gross(fills) / qty, now, mkt.close_ts, fees_c=fee)
         self.positions[mkt.ticker] = pos
         self._entries[mkt.ticker] = self._entries.get(mkt.ticker, 0) + 1
-        target = profit_target(pos.avg_cost, qty, cfg.min_profit, self.rate)
+        target = self._target(pos)
         self._record(now, mkt.ticker, "BUY", side, qty, pos.entry_price, fee, None,
                      f"model {sig['fair'][side]:.1f}c edge {edge:+.1f}c")
-        plan = f"sell when bid >= {target:.0f}c" if target else "hold to settlement"
+        plan = "hold to settlement"
+        if target:
+            plan = (f"resting sell order at {target:.0f}c" if cfg.exit == "limit"
+                    else f"sell when bid >= {target:.0f}c")
         self.log(f"BUY  {qty} {'UP/YES' if side == 'yes' else 'DOWN/NO'} @ {pos.entry_price:.1f}c"
                  f"  cost {usd(cost)} (fee {usd(fee)})  model {sig['fair'][side]:.1f}c, edge {edge:+.1f}c"
                  f"  -> {plan}")
@@ -580,31 +591,51 @@ class Bot:
 
     # ----- exits ---------------------------------------------------------- #
 
+    def _target(self, pos: Position) -> float | None:
+        """Price at which this position is sold for a profit after all fees."""
+        rate = self.maker_rate if self.cfg.exit == "limit" else self.rate
+        return profit_target(pos.avg_cost, pos.qty, self.cfg.min_profit, rate)
+
     def _manage(self, pos: Position, mkt: Market, book: Book, now: float):
         cfg = self.cfg
         bid = book.best_bid(pos.side)
         if bid is None:
             return
-        target = profit_target(pos.avg_cost, pos.qty, cfg.min_profit, self.rate)
-        secs_left = mkt.close_ts - now
+        target = self._target(pos)
         if target is not None and bid >= target - EPS:
-            self._sell(pos, mkt, target, now, "SELL", "profit")
+            self._take_profit(pos, mkt, book, target, now)
         elif cfg.stop_loss and bid <= pos.entry_price - cfg.stop_loss + EPS:
-            self._sell(pos, mkt, 1, now, "STOP", f"stop-loss ({cfg.stop_loss:.0f}c)")
-        elif cfg.exit_before_close and secs_left <= cfg.exit_before_close:
-            self._sell(pos, mkt, 1, now, "TIMEOUT", "time exit")
+            self._dump(pos, mkt, now, "STOP", f"stop-loss ({cfg.stop_loss:.0f}c)")
+        elif cfg.exit_before_close and mkt.close_ts - now <= cfg.exit_before_close:
+            self._dump(pos, mkt, now, "TIMEOUT", "time exit")
 
-    def _sell(self, pos: Position, mkt: Market, min_price: float, now: float, action: str, why: str):
-        self.clock.sleep(self.cfg.latency_ms / 1000.0)
-        fresh = self.kalshi.orderbook(mkt.ticker)
-        fills = sim_sell(fresh, pos.side, pos.qty, min_price, self.rate)
-        if action == "SELL":
-            # Only keep the part of the sale that really is profitable after fees.
+    def _take_profit(self, pos: Position, mkt: Market, book: Book, target: float, now: float):
+        if self.cfg.exit == "limit":
+            # Our sell order has been resting at `target` since the entry. A bid showing
+            # at or above it can only exist once every offer at that price, ours included,
+            # has been bought. We count the fill only when those bids cover the whole
+            # position, and at OUR price (not the higher bid), at the resting-order fee.
+            qty = filled(sim_sell(book, pos.side, pos.qty, target, 0.0))
+            fills = [Fill(target, qty, fee_cents(self.maker_rate, qty, target))] if qty == pos.qty else []
+        else:
+            # Marketable order: wait out the latency, then hit whatever bids are really
+            # there, keeping only the part that is still profitable after the taker fee.
+            self.clock.sleep(self.cfg.latency_ms / 1000.0)
+            fills = sim_sell(self.kalshi.orderbook(mkt.ticker), pos.side, pos.qty, target, self.rate)
             while fills and gross(fills) - fees(fills) < filled(fills) * (pos.avg_cost + self.cfg.min_profit) - EPS:
                 fills.pop()
+        self._book_sale(pos, fills, now, "SELL", "profit")
+
+    def _dump(self, pos: Position, mkt: Market, now: float, action: str, why: str):
+        """Get out now: marketable order against the real bids, taker fee."""
+        self.clock.sleep(self.cfg.latency_ms / 1000.0)
+        fills = sim_sell(self.kalshi.orderbook(mkt.ticker), pos.side, pos.qty, 1, self.rate)
+        self._book_sale(pos, fills, now, action, why)
+
+    def _book_sale(self, pos: Position, fills: list[Fill], now: float, action: str, why: str):
         qty = filled(fills)
         if not qty:
-            return                      # the bid vanished before our order arrived
+            return                      # nothing there to trade with
         avg_cost = pos.avg_cost
         proceeds, fee = gross(fills) - fees(fills), fees(fills)
         pnl = proceeds - avg_cost * qty
@@ -665,10 +696,10 @@ class Bot:
         pos = self.positions.get(mkt.ticker)
         if pos:
             bid = book.best_bid(pos.side)
-            target = profit_target(pos.avg_cost, pos.qty, self.cfg.min_profit, self.rate)
+            target = self._target(pos)
             line += (f"  | LONG {pos.qty} {'UP' if pos.side == 'yes' else 'DOWN'} @ {pos.entry_price:.1f}c"
                      f", bid {'--' if bid is None else f'{bid:.0f}'}c"
-                     + (f", need {target:.0f}c" if target else ""))
+                     + (f", sells at {target:.0f}c" if target else ""))
         else:
             line += f"  | flat, cash {usd(self.cash_c)}"
         self.log(line)
@@ -724,6 +755,10 @@ def parse_args(argv=None):
                     help="required model edge in cents per contract, after the entry fee")
     ap.add_argument("--min-profit", type=float, default=0.5,
                     help="take profit once the sale nets at least this many cents/contract after ALL fees")
+    ap.add_argument("--exit", choices=["limit", "market"], default="limit",
+                    help="limit: a sell order rests at the profit price from the moment of entry (how you "
+                         "would really do it; no fee on most series). market: watch the bid and hit it "
+                         "(pays the taker fee again, so it needs a bigger move)")
     ap.add_argument("--stop-loss", type=float, default=0.0,
                     help="sell if the bid falls this many cents below entry (0 = hold losers to settlement)")
     ap.add_argument("--exit-before-close", type=float, default=0.0,

@@ -39,8 +39,8 @@ class FakeKalshi:
         self.clock, self.open_ts, self.close_ts = clock, open_ts, open_ts + 900
         self.yes_bid, self.result, self.strike, self.depth = yes_bid, result, strike, depth
 
-    def fee_rate(self, series):
-        return 0.07
+    def fee_rates(self, series):
+        return 0.07, 0.0
 
     def _market(self):
         closed = self.clock.t >= self.close_ts + 30      # result posts 30s after the close
@@ -81,6 +81,8 @@ class Fees(unittest.TestCase):
         self.assertEqual(B.profit_target(51.75, 100, 0.0, 0.07), 54)
         self.assertEqual(B.profit_target(51.75, 100, 1.0, 0.07), 55)
         self.assertIsNone(B.profit_target(99.9, 100, 0.5, 0.07))
+        # a resting (fee-free) exit only has to clear the entry fee
+        self.assertEqual(B.profit_target(51.75, 100, 0.5, 0.0), 53)
 
 
 class Books(unittest.TestCase):
@@ -177,12 +179,43 @@ class Loop(unittest.TestCase):
         self.assertEqual(trade["side"], "yes")
         self.assertEqual(trade["how"], "SELL")
         # $100 stake: 192 @ 51c = $97.92 + $3.36 fee would bust the budget -> 189 contracts.
-        buy_cost = 189 * 51 + B.fee_cents(0.07, 189, 51)
-        sell_net = 189 * 58 - B.fee_cents(0.07, 189, 58)
+        buy_cost = 189 * 51 + B.fee_cents(0.07, 189, 51)        # avg cost 52.76c
+        # The resting sell sits at 54c. The bid gaps to 58c, but a resting order only
+        # ever gets its own price, and pays no fee on this series.
+        sell_net = 189 * 54
         self.assertAlmostEqual(trade["pnl_c"], sell_net - buy_cost)
         self.assertAlmostEqual(bot.cash_c, 100_000 + sell_net - buy_cost)
         self.assertGreater(trade["pnl_c"], 0)
         self.assertEqual(bot.positions, {})
+
+    def test_market_exit_hits_the_bid_and_pays_the_taker_fee(self):
+        bot, _ = self.run_scenario(
+            yes_bid=lambda s: 50 if s < 60 else (54 if s < 120 else 58),
+            spot_path=lambda t: 100_000 if t < 1_000_030 else 100_150,
+            result="yes", max_entries=1, exit="market")
+        (trade,) = bot.closed
+        buy_cost = 189 * 51 + B.fee_cents(0.07, 189, 51)
+        # 54c is not enough once the exit fee is counted (needs 55c), so it waits for 58c.
+        self.assertGreaterEqual(trade["held_s"], 85)
+        self.assertAlmostEqual(trade["pnl_c"], 189 * 58 - B.fee_cents(0.07, 189, 58) - buy_cost)
+
+    def test_resting_order_is_not_filled_by_a_bid_too_small_to_reach_it(self):
+        clock = Clock()
+        k = FakeKalshi(clock, clock.t, lambda s: 50 if s < 60 else 54, "yes")
+        orig = k.orderbook
+
+        def book(ticker):
+            b = orig(ticker)
+            if 60 <= clock.t - k.open_ts < 120:
+                b.yes = [(54, 100), (40, 500)]      # only 100 bid at 54c; we are offering 189
+            return b
+        k.orderbook = book
+        bot, _ = make_bot(k, FakeSpot(clock, lambda t: 100_000 if t < 1_000_030 else 100_150), clock,
+                          minutes=3, max_entries=1)
+        bot.run()
+        (trade,) = bot.closed
+        self.assertGreaterEqual(trade["held_s"], 85)          # waited for a bid big enough
+        self.assertAlmostEqual(trade["pnl_c"], 189 * 54 - (189 * 51 + B.fee_cents(0.07, 189, 51)))
 
     def test_loser_is_held_and_settled_from_the_official_result(self):
         # Buys UP on a spot pop, then the market collapses and resolves NO.
@@ -245,8 +278,7 @@ class Loop(unittest.TestCase):
         bot.run()
         (trade,) = bot.closed
         # only 40 contracts were offered at 51c, so only 40 were bought
-        self.assertAlmostEqual(trade["pnl_c"], 40 * 58 - B.fee_cents(0.07, 40, 58)
-                               - (40 * 51 + B.fee_cents(0.07, 40, 51)))
+        self.assertAlmostEqual(trade["pnl_c"], 40 * 54 - (40 * 51 + B.fee_cents(0.07, 40, 51)))
 
     def test_state_survives_a_restart(self):
         clock = Clock()
