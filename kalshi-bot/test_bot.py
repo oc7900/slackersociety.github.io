@@ -33,6 +33,9 @@ class FakeSpot:
     def avg_between(self, t0, t1, min_samples=15):
         return self.path(t1)
 
+    def momentum(self, now, secs=60.0):
+        return 0.0
+
 
 class FakeKalshi:
     """One 15-minute market whose YES bid/ask follow a script; 500 contracts a level."""
@@ -153,6 +156,17 @@ class Books(unittest.TestCase):
         self.assertIn("XBTUSD", B.FEEDS["kraken"][0]("BTC"))
         self.assertIn("ETHUSD", B.FEEDS["kraken"][0]("ETH"))
 
+    def test_momentum_is_the_last_minutes_move(self):
+        import math
+        s = B.Spot("BTC")
+        self.assertEqual(s.momentum(1000.0), 0.0)                 # nothing seen yet
+        for i in range(90):
+            s._ticks.append((1000.0 + i, 60000.0 + 2 * i))        # climbing $2 a second
+        self.assertAlmostEqual(s.momentum(1089.0), math.log(60178 / 60058))
+        s._ticks.clear()
+        s._ticks.append((1089.0, 60000.0))
+        self.assertEqual(s.momentum(1089.0), 0.0)                 # no reading from a minute ago
+
     def test_empty_book(self):
         b = B.parse_book({"orderbook": {"yes": None, "no": None}})
         self.assertIsNone(b.best_bid("yes"))
@@ -187,6 +201,9 @@ class Model(unittest.TestCase):
         self.assertAlmostEqual(B.prob_up(100, 100, 0.001, 600), 0.5)
         self.assertGreater(B.prob_up(100.2, 100, 0.0005, 600), 0.85)
         self.assertLess(B.prob_up(99.8, 100, 0.0005, 600), 0.15)
+        # momentum toward the target raises the odds, away from it lowers them
+        self.assertGreater(B.prob_up(100, 100, 0.0005, 600, drift=0.0005), 0.6)
+        self.assertLess(B.prob_up(100, 100, 0.0005, 600, drift=-0.0005), 0.4)
         # the same gap matters more with less time left
         self.assertGreater(B.prob_up(100.05, 100, 0.0005, 60), B.prob_up(100.05, 100, 0.0005, 840))
 
@@ -289,6 +306,23 @@ class Loop(unittest.TestCase):
         (trade,) = bot.closed
         self.assertEqual((trade["side"], trade["how"]), ("no", "SELL"))
         self.assertGreater(trade["pnl_c"], 0)
+
+    def test_momentum_tips_an_otherwise_even_call(self):
+        # Price sits exactly on the target (a coin flip), but it has just risen 0.1% in a minute.
+        clock = Clock()
+        k = FakeKalshi(clock, clock.t, lambda s: 50, "yes")
+        spot = FakeSpot(clock, lambda t: 100_000)
+        spot.momentum = lambda now, secs=60.0: 0.001
+        bot, _ = make_bot(k, spot, clock, minutes=1, max_entries=1)
+        bot.run()
+        self.assertEqual(bot.positions["T-1"].side, "yes")
+        clock = Clock()
+        k = FakeKalshi(clock, clock.t, lambda s: 50, "yes")
+        spot = FakeSpot(clock, lambda t: 100_000)
+        spot.momentum = lambda now, secs=60.0: 0.001
+        bot, _ = make_bot(k, spot, clock, minutes=1, max_entries=1, momentum=0)   # told to ignore it
+        bot.run()
+        self.assertEqual(bot.positions, {})
 
     def test_no_trade_without_edge_or_outside_the_entry_window(self):
         # fair coin, fairly priced: nothing to do

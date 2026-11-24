@@ -22,8 +22,9 @@ per-second research log there (`ticks.csv`, `windows.csv`, `basis.csv`).
 1. **Waits for a new 15-minute window** and reads the strike (the "price to beat").
 2. **Picks a side.** Each second it estimates the fair probability that BTC
    finishes above the strike, from its own rebuild of the settlement index
-   (see below), how far that is from the strike, how much time is left and how
-   volatile the last hour was. If
+   (see below), how far that is from the strike, how much time is left, how
+   volatile the last hour was, and the momentum of the last minute (it assumes
+   a share of that move carries on; `--momentum`, default 0.2). If
    UP or DOWN is selling for less than that fair value by more than the
    entry fee plus a margin (`--min-edge`), that is the side it buys.
 3. **Only early and only near 50/50**: first 6 minutes of the window
@@ -55,8 +56,9 @@ these public tickers refresh only every second or so.
 few trades:
 
 1. how closely the rebuilt index tracks the real one (and which exchange is worst);
-2. when the model and the market disagree, which one the price then moves toward;
-3. the whole strategy replayed at every recorded second, with the side picked by
+2. whether momentum really carries on, and what `--momentum` value the data supports;
+3. when the model and the market disagree, which one the price then moves toward;
+4. the whole strategy replayed at every recorded second, with the side picked by
    the model versus picked blindly.
 
 An edge shows up as "model's pick" clearly beating "either side (blind)" and
@@ -109,6 +111,7 @@ trades before drawing any conclusion.
 | `--band` | 8 | enter only within this many cents of 50¢ |
 | `--entry-window` | 6 | enter only in the first N minutes |
 | `--min-edge` | 1 | cents the model must say you are ahead, after the entry fee |
+| `--momentum` | 0.2 | share of the last minute's move assumed to continue (0 = ignore) |
 | `--min-profit` | 0.5 | cents per contract of net profit that triggers the sale |
 | `--exit` | `limit` | `market` = hit the bid instead (pays the fee twice) |
 | `--stop-loss` | 0 (off) | cents below entry at which to bail out |

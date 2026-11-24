@@ -17,7 +17,8 @@ Strategy
 --------
   1. Early in each window, while the contract still trades near 50/50, compare
      the market price with a fair-value estimate of P(up) computed from the
-     live spot price, the window's strike and recent realised volatility.
+     live price, the window's target (strike), the time left, recent volatility
+     and the momentum of the last minute.
   2. If one side is cheap versus the model by more than the entry fee plus a
      margin, buy that side (an immediate-or-cancel limit order against the book).
   3. Sell the moment the bid is high enough that the sale nets a profit AFTER
@@ -293,6 +294,15 @@ class Spot:
         xs = [p for ts, p in self._ticks if t0 <= ts <= t1]
         return sum(xs) / len(xs) if len(xs) >= min_samples else None
 
+    def momentum(self, now: float, secs: float = 60.0) -> float:
+        """Log return of the index replica over the last `secs` seconds (0 if unknown)."""
+        if not self._ticks:
+            return 0.0
+        then = min(self._ticks, key=lambda t: abs(t[0] - (now - secs)))
+        if abs(then[0] - (now - secs)) > 5 or then[1] <= 0:
+            return 0.0
+        return math.log(self._ticks[-1][1] / then[1])
+
     def feed_avgs(self, t0: float, t1: float) -> dict[str, float]:
         """Each exchange's own average over [t0, t1] (to see which tracks the index best)."""
         out = {}
@@ -406,13 +416,15 @@ def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def prob_up(spot: float, strike: float, sigma_1m: float, secs_left: float) -> float:
-    """P(price finishes above the strike), modelling the remaining move as a
-    driftless random walk with the recently realised volatility."""
+def prob_up(spot: float, strike: float, sigma_1m: float, secs_left: float, drift: float = 0.0) -> float:
+    """P(price finishes above the strike). Where the price is now versus the target,
+    plus `drift` (how much further momentum is expected to carry it, as a log return),
+    measured against how far it could plausibly wander in the time left given the
+    recently realised volatility."""
     if spot <= 0 or strike <= 0:
         return 0.5
     sd = max(sigma_1m, MIN_SIGMA_1M) * math.sqrt(max(secs_left, 1.0) / 60.0)
-    return norm_cdf(math.log(spot / strike) / sd)
+    return norm_cdf((math.log(spot / strike) + drift) / sd)
 
 
 # --------------------------------------------------------------------------- #
@@ -532,14 +544,14 @@ class Bot:
             self._ticks_file = open(self.ticks_path, "a", newline="")
             if new:
                 self._ticks_file.write("ts,ticker,secs_left,strike,index,feeds,sigma_1m,model_up,"
-                                       "up_bid,up_ask,up_bid_size,up_ask_size\n")
+                                       "up_bid,up_ask,up_bid_size,up_ask_size,mom_60_bp\n")
         yes, no = book.yes[:1], book.no[:1]
         if not yes or not no:
             return
         self._ticks_file.write(
             f"{now:.0f},{mkt.ticker},{mkt.close_ts - now:.0f},{sig['strike']:.2f},{sig['spot']:.2f},"
             f"{len(self.spot.live)},{sig['sigma']:.6f},{sig['p_up'] * 100:.2f},"
-            f"{yes[0][0]:g},{100 - no[0][0]:g},{yes[0][1]},{no[0][1]}\n")
+            f"{yes[0][0]:g},{100 - no[0][0]:g},{yes[0][1]},{no[0][1]},{sig['mom'] * 1e4:.3f}\n")
         self._ticks_file.flush()
 
     def _record_basis(self, mkt: Market, strike: float, ours: float):
@@ -647,8 +659,13 @@ class Bot:
         strike, basis = self._strike(mkt, now)
         if not strike:
             return None
-        p_up = prob_up(spot + basis, strike, sigma, mkt.close_ts - now)
-        sig = {"spot": spot + basis, "strike": strike, "sigma": sigma, "p_up": p_up, "edge": {}, "fair": {}}
+        # Momentum: assume a fraction (--momentum) of the last minute's move carries on.
+        secs_left = mkt.close_ts - now
+        mom = self.spot.momentum(now, 60.0)
+        drift = self.cfg.momentum * mom * min(1.0, secs_left / 60.0)
+        p_up = prob_up(spot + basis, strike, sigma, secs_left, drift)
+        sig = {"spot": spot + basis, "strike": strike, "sigma": sigma, "p_up": p_up, "mom": mom,
+               "edge": {}, "fair": {}}
         for side, p in (("yes", p_up), ("no", 1 - p_up)):
             ask = book.best_ask(side)
             sig["fair"][side] = p * 100
@@ -840,7 +857,7 @@ class Bot:
         line = f"T-{left // 60:02d}:{left % 60:02d}  UP {q('yes')}  DOWN {q('no')}"
         if sig:
             line += (f"  | spot {sig['spot']:,.2f} vs {sig['strike']:,.2f}"
-                     f"  model UP {sig['p_up'] * 100:.0f}%")
+                     f"  last min {sig['mom'] * sig['spot']:+,.0f}  model UP {sig['p_up'] * 100:.0f}%")
         pos = self.positions.get(mkt.ticker)
         if pos:
             bid = book.best_bid(pos.side)
@@ -905,6 +922,9 @@ def parse_args(argv=None):
                     help="only enter during the first N minutes of a window")
     ap.add_argument("--min-edge", type=float, default=1.0,
                     help="required model edge in cents per contract, after the entry fee")
+    ap.add_argument("--momentum", type=float, default=0.2,
+                    help="share of the last minute's price move assumed to carry on (0 = ignore momentum, "
+                         "negative = expect it to reverse); edge_check.py estimates the right value from data")
     ap.add_argument("--min-profit", type=float, default=0.5,
                     help="take profit once the sale nets at least this many cents/contract after ALL fees")
     ap.add_argument("--exit", choices=["limit", "market"], default="limit",

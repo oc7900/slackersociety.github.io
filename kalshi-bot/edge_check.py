@@ -4,12 +4,13 @@ Is there any edge?  Measures it from what bot.py recorded in data/.
 
     python3 edge_check.py            (run bot.py first; a day of data is a fair start)
 
-Three questions, each answered from the per-second log rather than from the
+Four questions, each answered from the per-second log rather than from the
 handful of trades the bot happened to take:
 
   1. How well does our rebuilt index track the real one?            (basis.csv)
-  2. When the model disagrees with the market, who is right?        (ticks.csv)
-  3. Replaying "buy near 50/50, sell at the first profit" at EVERY
+  2. Does momentum carry on, and how much?                          (ticks.csv)
+  3. When the model disagrees with the market, who is right?        (ticks.csv)
+  4. Replaying "buy near 50/50, sell at the first profit" at EVERY
      recorded second: does picking the side with the model beat
      picking it blindly, and does either make money after fees?     (ticks.csv + windows.csv)
 """
@@ -59,7 +60,7 @@ def by_window(ticks: list[dict]) -> dict[str, list[dict]]:
     for r in ticks:
         try:
             row = {"ts": float(r["ts"]), "left": float(r["secs_left"]), "model": float(r["model_up"]),
-                   "bid": float(r["up_bid"]), "ask": float(r["up_ask"])}
+                   "bid": float(r["up_bid"]), "ask": float(r["up_ask"]), "index": float(r["index"])}
         except (KeyError, ValueError):
             continue
         row["mid"] = (row["bid"] + row["ask"]) / 2
@@ -69,8 +70,39 @@ def by_window(ticks: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
+def momentum_check(windows: dict[str, list[dict]]):
+    print("2. DOES MOMENTUM CARRY ON?")
+    pairs = []                                         # (last minute's move, next minute's move)
+    for rows in windows.values():
+        at = {round(r["ts"]): r["index"] for r in rows}
+
+        def near(t):
+            return next((at[t + d] for d in (0, 1, -1, 2, -2) if t + d in at), None)
+        if not rows:
+            continue
+        t = round(rows[0]["ts"]) + 60
+        while t + 60 <= round(rows[-1]["ts"]):
+            a, b, c = near(t - 60), near(t), near(t + 60)
+            if a and b and c:
+                pairs.append((math.log(b / a), math.log(c / b)))
+            t += 60
+    if len(pairs) < 30:
+        print(f"   not enough data yet ({len(pairs)} one-minute pairs; need a few hours).\n")
+        return
+    sxx = sum(x * x for x, _ in pairs)
+    k = sum(x * y for x, y in pairs) / sxx
+    se = math.sqrt(sum((y - k * x) ** 2 for x, y in pairs) / (len(pairs) - 1) / sxx)
+    same = mean([1.0 if x * y > 0 else 0.0 for x, y in pairs if x and y])
+    print(f"   After a move in one minute, the next minute continued {k * 100:+.0f}% of it on average "
+          f"(+/-{2 * se * 100:.0f}%, {len(pairs)} minute-pairs);")
+    print(f"   the next minute went the same direction {same * 100:.0f}% of the time (50% = no momentum).")
+    verdict = ("no reliable momentum either way: --momentum 0 is the honest setting" if abs(k) < 2 * se
+               else f"use about --momentum {k:.2f}" + (" (moves tend to REVERSE)" if k < 0 else ""))
+    print(f"   Reading it: {verdict}.\n")
+
+
 def who_is_right(windows: dict[str, list[dict]], results: dict[str, str]):
-    print("2. WHEN THE MODEL DISAGREES WITH THE MARKET, WHO IS RIGHT?")
+    print("3. WHEN THE MODEL DISAGREES WITH THE MARKET, WHO IS RIGHT?")
     for horizon in (10, 30, 60):
         pairs = []                                     # (model minus market now, market's move after)
         for rows in windows.values():
@@ -118,7 +150,7 @@ def who_is_right(windows: dict[str, list[dict]], results: dict[str, str]):
 
 def replay(windows: dict[str, list[dict]], results: dict[str, str], band: float, entry_secs: float,
            min_edge: float, min_profit: float):
-    print("3. REPLAYING THE STRATEGY AT EVERY RECORDED SECOND")
+    print("4. REPLAYING THE STRATEGY AT EVERY RECORDED SECOND")
     print(f"   Buy at the offer when within {band:g}c of 50 in the first {entry_secs / 60:g} min; rest a sell at the")
     print("   first price that is a profit after the fee; otherwise settle at Kalshi's result.")
     groups = {"model's pick": [], "the other side": [], "either side (blind)": []}
@@ -190,6 +222,7 @@ def main():
     if not ticks:
         print("No tick data yet: run bot.py for a while first.")
         return
+    momentum_check(windows)
     who_is_right(windows, results)
     replay(windows, results, a.band, a.entry_window * 60, a.min_edge, a.min_profit)
 
