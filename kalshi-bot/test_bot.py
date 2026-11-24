@@ -19,6 +19,8 @@ class Clock:
 
 
 class FakeSpot:
+    live = ["fake"]
+
     def __init__(self, clock, path):
         self.clock, self.path = clock, path     # path(t) -> spot price
 
@@ -47,8 +49,8 @@ class FakeKalshi:
         return B.Market("T-1", "test", self.open_ts, self.close_ts, self.strike,
                         "active", self.result if closed else "")
 
-    def open_markets(self, series):
-        return [self._market()] if self.clock.t < self.close_ts else []
+    def current_markets(self, series, now):
+        return [self._market()] if now < self.close_ts else []
 
     def market(self, ticker):
         return self._market()
@@ -114,11 +116,42 @@ class Books(unittest.TestCase):
         self.assertEqual((m.strike, m.close_ts - m.open_ts, m.result), (60303.97, 900.0, ""))
 
     def test_spot_history_average(self):
-        s = B.Spot("BTC-USD")
+        s = B.Spot("BTC")
         for i in range(60):
             s._ticks.append((1000.0 + i, 100.0 + i))
         self.assertAlmostEqual(s.avg_between(1000, 1059), 129.5)
         self.assertIsNone(s.avg_between(2000, 2060))              # was not watching then
+
+    def test_index_replica_blends_exchanges_and_survives_one_dropping_out(self):
+        s = B.Spot("BTC", ["coinbase", "kraken", "bitstamp"])
+        quotes = {"coinbase": 100.0, "kraken": 106.0, "bitstamp": 103.0}
+        s._fetch = lambda name: quotes[name] if quotes[name] else (_ for _ in ()).throw(B.FeedError(name))
+        for i in range(400):                       # learn each exchange's usual gap to the blend
+            px = s.price(1000.0 + i)
+        self.assertAlmostEqual(px, 103.0)
+        self.assertEqual(s.live, ["bitstamp", "coinbase", "kraken"])
+        quotes["kraken"] = None                    # Kraken (the +3 one) stops answering
+        px = s.price(1500.0)                       # its old quote is stale by now
+        self.assertEqual(s.live, ["bitstamp", "coinbase"])
+        self.assertAlmostEqual(px, 103.0, delta=0.05)     # no jump to 101.5
+        quotes.update(coinbase=None, bitstamp=None)
+        with self.assertRaises(B.FeedError):
+            s.price(1600.0)
+
+    def test_feed_parsers(self):
+        # trimmed real replies
+        cases = {
+            "coinbase": {"ask": "60193.48", "bid": "60193.47", "price": "60193.48"},
+            "kraken": {"error": [], "result": {"XXBTZUSD": {"a": ["60200.1", "1", "1.0"], "b": ["60200.0", "1", "1.0"]}}},
+            "bitstamp": {"bid": "60190", "ask": "60191", "last": "60190"},
+            "gemini": {"bid": "60188.5", "ask": "60189.5", "last": "60189"},
+            "cryptocom": {"result": {"data": [{"i": "BTC_USD", "b": "60195.0", "k": "60196.0", "a": "60195.5"}]}},
+        }
+        for name, reply in cases.items():
+            bid, ask = (float(x) for x in B.FEEDS[name][1](reply))
+            self.assertTrue(60000 < bid <= ask < 60300, name)
+        self.assertIn("XBTUSD", B.FEEDS["kraken"][0]("BTC"))
+        self.assertIn("ETHUSD", B.FEEDS["kraken"][0]("ETH"))
 
     def test_empty_book(self):
         b = B.parse_book({"orderbook": {"yes": None, "no": None}})

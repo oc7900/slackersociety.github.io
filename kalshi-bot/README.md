@@ -7,20 +7,23 @@ book**: no account, no API key, and it never sends an order.
 ```
 python3 bot.py                 # run until Ctrl-C  ($1,000 paper bankroll, $100 per trade)
 python3 bot.py --report        # results so far
+python3 edge_check.py          # is there any edge? (measured from the recorded data)
 python3 bot.py --reset         # wipe saved state and start over
 python3 bot.py --help          # every setting
 python3 -m unittest            # offline tests (no network)
 ```
 
 Python 3.9+, standard library only. State and the trade log live in `data/`
-(`state.json`, `trades.csv`), so you can stop and restart it.
+(`state.json`, `trades.csv`), so you can stop and restart it. It also keeps a
+per-second research log there (`ticks.csv`, `windows.csv`, `basis.csv`).
 
 ## What it does
 
 1. **Waits for a new 15-minute window** and reads the strike (the "price to beat").
 2. **Picks a side.** Each second it estimates the fair probability that BTC
-   finishes above the strike, from the live Coinbase price, how far it is from
-   the strike, how much time is left and how volatile the last hour was. If
+   finishes above the strike, from its own rebuild of the settlement index
+   (see below), how far that is from the strike, how much time is left and how
+   volatile the last hour was. If
    UP or DOWN is selling for less than that fair value by more than the
    entry fee plus a margin (`--min-edge`), that is the side it buys.
 3. **Only early and only near 50/50**: first 6 minutes of the window
@@ -32,6 +35,32 @@ Python 3.9+, standard library only. State and the trade log live in `data/`
    $1 or $0 per contract from Kalshi's official result. (`--stop-loss 10` sells
    instead once the bid is 10¢ under the entry.)
 6. Repeats, up to 3 round trips per window, window after window.
+
+## The price it watches
+
+Kalshi does not settle on Coinbase. It settles on a CF Benchmarks index built
+from several exchanges, and those exchanges routinely sit $15-25 apart. So the
+bot polls five of the index's member exchanges at once (Coinbase, Kraken,
+Bitstamp, Gemini, Crypto.com), blends them, and at every window open lines the
+blend up against the real index value, which is the strike Kalshi publishes.
+Drop any that are unreachable for you with `--feeds coinbase,kraken`.
+
+This makes the bot's information less wrong. It does not make it better than
+the market makers': they have streaming feeds from the same exchanges, and
+these public tickers refresh only every second or so.
+
+## Is there an edge? Measure it
+
+`python3 edge_check.py` answers that from the per-second log instead of from a
+few trades:
+
+1. how closely the rebuilt index tracks the real one (and which exchange is worst);
+2. when the model and the market disagree, which one the price then moves toward;
+3. the whole strategy replayed at every recorded second, with the side picked by
+   the model versus picked blindly.
+
+An edge shows up as "model's pick" clearly beating "either side (blind)" and
+being above zero. Give it at least a day of recording (about 100 windows).
 
 ## Why the paper fills are realistic
 
@@ -83,11 +112,12 @@ trades before drawing any conclusion.
 | `--min-profit` | 0.5 | cents per contract of net profit that triggers the sale |
 | `--exit` | `limit` | `market` = hit the bid instead (pays the fee twice) |
 | `--stop-loss` | 0 (off) | cents below entry at which to bail out |
+| `--feeds` | all five | exchanges blended into the index rebuild |
 | `--max-entries` | 3 | round trips per window |
 
 The first window after start-up is watched but not traded: the bot needs to
-have seen the price at the window's open to line Coinbase up with the index
-Kalshi settles on.
+have seen prices at the window's open to line its index rebuild up with the
+real one.
 
 Going live would need a Kalshi API key and order placement; none of that is
 here on purpose.

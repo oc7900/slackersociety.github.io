@@ -41,18 +41,36 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 COINBASE_API = "https://api.exchange.coinbase.com"
 
-# Kalshi series -> Coinbase product used as the live spot reference.
-SPOT_PRODUCT = {
-    "KXBTC15M": "BTC-USD",
-    "KXETH15M": "ETH-USD",
-    "KXSOL15M": "SOL-USD",
-    "KXXRP15M": "XRP-USD",
+# Kalshi series -> the asset it is about.
+ASSET = {"KXBTC15M": "BTC", "KXETH15M": "ETH", "KXSOL15M": "SOL", "KXXRP15M": "XRP"}
+
+
+def _first(d: dict):
+    return next(iter(d.values()))
+
+
+# Kalshi settles these markets on a CF Benchmarks index, which is built from the
+# order books of several exchanges. These are the constituents that publish a
+# keyless ticker; blending them tracks the index far better than any one exchange.
+# name -> (url for an asset, function pulling (bid, ask) out of the JSON reply)
+FEEDS = {
+    "coinbase": (lambda a: f"{COINBASE_API}/products/{a}-USD/ticker",
+                 lambda j: (j["bid"], j["ask"])),
+    "kraken": (lambda a: f"https://api.kraken.com/0/public/Ticker?pair={'XBT' if a == 'BTC' else a}USD",
+               lambda j: (_first(j["result"])["b"][0], _first(j["result"])["a"][0])),
+    "bitstamp": (lambda a: f"https://www.bitstamp.net/api/v2/ticker/{a.lower()}usd/",
+                 lambda j: (j["bid"], j["ask"])),
+    "gemini": (lambda a: f"https://api.gemini.com/v1/pubticker/{a.lower()}usd",
+               lambda j: (j["bid"], j["ask"])),
+    "cryptocom": (lambda a: f"https://api.crypto.com/exchange/v1/public/get-tickers?instrument_name={a}_USD",
+                  lambda j: (j["result"]["data"][0]["b"], j["result"]["data"][0]["k"])),
 }
 
 DEFAULT_FEE_RATE = 0.07   # Kalshi general taker fee: 0.07 * contracts * P * (1 - P)
@@ -120,7 +138,6 @@ class Market:
     strike: float | None          # "price to beat"; None if Kalshi does not publish one
     status: str
     result: str                   # "yes" / "no" once settled, else ""
-    strike_live: bool = False     # strike confirmed from the live (uncached) endpoint
 
     @classmethod
     def from_api(cls, m: dict) -> "Market":
@@ -200,9 +217,13 @@ class Kalshi:
         maker = MAKER_FEE_RATE * mult if "maker" in (s.get("fee_type") or "") else 0.0
         return DEFAULT_FEE_RATE * mult, maker
 
-    def open_markets(self, series: str) -> list[Market]:
-        data = http_get(f"{self.base}/markets",
-                        {"series_ticker": series, "status": "open", "limit": 100})
+    def current_markets(self, series: str, now: float) -> list[Market]:
+        """Markets of the series closing within the next 16 minutes. Asking by close
+        time (with a fresh timestamp) bypasses the 15-second cache on the plain
+        "open markets" list, which shows a new window up to 30 seconds late. It is
+        a costlier call for Kalshi's rate limit, so it is only used at window changes."""
+        data = http_get(f"{self.base}/markets", {
+            "series_ticker": series, "min_close_ts": int(now), "max_close_ts": int(now) + 960, "limit": 20})
         return [Market.from_api(m) for m in data.get("markets") or []]
 
     def market(self, ticker: str) -> Market:
@@ -213,22 +234,57 @@ class Kalshi:
 
 
 class Spot:
-    """Live spot price from Coinbase (public). Every price we see is remembered,
-    because Coinbase's candle endpoint lags by minutes; candles are only used
-    for the volatility estimate."""
+    """Our replica of the settlement index: the average mid-price across the
+    constituent exchanges, fetched in parallel every tick. Every value is
+    remembered, so the bot can average its own readings over any past minute."""
 
-    def __init__(self, product: str, base: str = COINBASE_API):
-        self.product, self.base = product, base
+    STALE = 3.0          # seconds a quote stays usable
+    BENCH = 60.0         # seconds a feed that keeps failing is rested
+
+    def __init__(self, asset: str, feeds: list[str] | None = None):
+        self.asset = asset
+        self.feeds = {n: FEEDS[n] for n in (feeds or FEEDS)}
+        self._pool = ThreadPoolExecutor(max_workers=len(self.feeds))
+        self._last: dict[str, tuple[float, float]] = {}       # feed -> (ts, mid)
+        self._offset = {n: 0.0 for n in self.feeds}           # feed's usual gap to the blend
+        self._fails = {n: 0 for n in self.feeds}
+        self._benched: dict[str, float] = {}
+        self.live: list[str] = []                             # feeds used in the latest price
         self._ticks: deque[tuple[float, float]] = deque(maxlen=4000)   # (ts, price)
+        self._feed_ticks = {n: deque(maxlen=300) for n in self.feeds}  # per exchange, for comparison
         self._candles: list[tuple[float, float, float]] = []   # (start_ts, open, close) oldest first
         self._candles_at = 0.0
 
+    def _fetch(self, name: str) -> float:
+        url, parse = self.feeds[name]
+        bid, ask = (float(x) for x in parse(http_get(url(self.asset), timeout=2.0, retries=0)))
+        if not 0 < bid <= ask * 1.01:
+            raise FeedError(f"{name}: implausible quote {bid}/{ask}")
+        return (bid + ask) / 2
+
     def price(self, now: float) -> float:
-        t = http_get(f"{self.base}/products/{self.product}/ticker")
-        bid, ask, last = _num(t.get("bid")), _num(t.get("ask")), _num(t.get("price"))
-        px = (bid + ask) / 2 if bid and ask else last
-        if not px:
-            raise FeedError("spot ticker had no price")
+        jobs = {n: self._pool.submit(self._fetch, n) for n in self.feeds
+                if self._benched.get(n, 0) <= now}
+        for n, job in jobs.items():
+            try:
+                self._last[n] = (now, job.result())
+                self._feed_ticks[n].append(self._last[n])
+                self._fails[n] = 0
+            except Exception:                      # one exchange being down must not stop the bot
+                self._fails[n] += 1
+                if self._fails[n] >= 5:
+                    self._benched[n] = now + self.BENCH
+        mids = {n: m for n, (ts, m) in self._last.items() if now - ts <= self.STALE}
+        if not mids:
+            raise FeedError("no exchange price feed answered")
+        # Each exchange sits a few dollars off the blend. Removing that usual gap
+        # keeps the blend from jumping when one exchange misses a tick.
+        px = sum(m - self._offset[n] for n, m in mids.items()) / len(mids)
+        if len(mids) == len(self.feeds) - len([n for n in self._benched if self._benched[n] > now]):
+            raw = sum(mids.values()) / len(mids)
+            for n, m in mids.items():
+                self._offset[n] += 0.02 * ((m - raw) - self._offset[n])
+        self.live = sorted(mids)
         self._ticks.append((now, px))
         return px
 
@@ -237,16 +293,35 @@ class Spot:
         xs = [p for ts, p in self._ticks if t0 <= ts <= t1]
         return sum(xs) / len(xs) if len(xs) >= min_samples else None
 
+    def feed_avgs(self, t0: float, t1: float) -> dict[str, float]:
+        """Each exchange's own average over [t0, t1] (to see which tracks the index best)."""
+        out = {}
+        for n, ticks in self._feed_ticks.items():
+            xs = [p for ts, p in ticks if t0 <= ts <= t1]
+            if len(xs) >= 15:
+                out[n] = sum(xs) / len(xs)
+        return out
+
     def candles(self, now: float) -> list[tuple[float, float, float]]:
         if now - self._candles_at >= 30 or not self._candles:
-            rows = http_get(f"{self.base}/products/{self.product}/candles", {"granularity": 60})
+            self._candles_at = now
+            rows = http_get(f"{COINBASE_API}/products/{self.asset}-USD/candles", {"granularity": 60})
             # row = [start, low, high, open, close, volume], newest first
             self._candles = sorted((float(r[0]), float(r[3]), float(r[4])) for r in rows)
-            self._candles_at = now
         return self._candles
 
     def sigma_1m(self, now: float, lookback: int = 60) -> float:
-        closes = [c for _, _, c in self.candles(now)][-(lookback + 1):]
+        """Recent volatility: standard deviation of 1-minute returns over the last hour."""
+        try:
+            closes = [c for _, _, c in self.candles(now)][-(lookback + 1):]
+        except FeedError:
+            closes = [c for _, _, c in self._candles][-(lookback + 1):]
+        if len(closes) < 11:                       # no candles: use our own readings, a minute apart
+            closes, nxt = [], 0.0
+            for ts, p in self._ticks:
+                if ts >= nxt:
+                    closes.append(p)
+                    nxt = ts + 60
         rets = [math.log(b / a) for a, b in zip(closes, closes[1:]) if a > 0 and b > 0]
         if len(rets) < 10:
             return MIN_SIGMA_1M * 4
@@ -396,6 +471,12 @@ class Bot:
         os.makedirs(cfg.data_dir, exist_ok=True)
         self.state_path = os.path.join(cfg.data_dir, "state.json")
         self.trades_path = os.path.join(cfg.data_dir, "trades.csv")
+        self.ticks_path = os.path.join(cfg.data_dir, "ticks.csv")       # research log, see edge_check.py
+        self.windows_path = os.path.join(cfg.data_dir, "windows.csv")
+        self.basis_path = os.path.join(cfg.data_dir, "basis.csv")
+        self._ticks_file = None
+        self._awaiting_result: list[Market] = []
+        self._result_poll = 0.0
         if cfg.reset:
             for p in (self.state_path, self.trades_path):
                 if os.path.exists(p):
@@ -441,6 +522,57 @@ class Bot:
     def log(self, msg: str):
         self.out(f"{hhmmss(self.clock.time())}  {msg}")
 
+    def _record_tick(self, now: float, mkt: Market, book: Book, sig: dict):
+        """One row per second: what the model thought and what the market charged.
+        edge_check.py reads this to test whether the model knows anything the market doesn't."""
+        if self.cfg.no_record:
+            return
+        if self._ticks_file is None:
+            new = not os.path.exists(self.ticks_path)
+            self._ticks_file = open(self.ticks_path, "a", newline="")
+            if new:
+                self._ticks_file.write("ts,ticker,secs_left,strike,index,feeds,sigma_1m,model_up,"
+                                       "up_bid,up_ask,up_bid_size,up_ask_size\n")
+        yes, no = book.yes[:1], book.no[:1]
+        if not yes or not no:
+            return
+        self._ticks_file.write(
+            f"{now:.0f},{mkt.ticker},{mkt.close_ts - now:.0f},{sig['strike']:.2f},{sig['spot']:.2f},"
+            f"{len(self.spot.live)},{sig['sigma']:.6f},{sig['p_up'] * 100:.2f},"
+            f"{yes[0][0]:g},{100 - no[0][0]:g},{yes[0][1]},{no[0][1]}\n")
+        self._ticks_file.flush()
+
+    def _record_basis(self, mkt: Market, strike: float, ours: float):
+        """At each open the true index value is known (it is the strike). Log how far
+        the replica, and each exchange alone, was from it: the replica's error."""
+        if self.cfg.no_record or not mkt.strike or not hasattr(self.spot, "feed_avgs"):
+            return
+        feeds = self.spot.feed_avgs(mkt.open_ts - 60, mkt.open_ts)
+        new = not os.path.exists(self.basis_path)
+        with open(self.basis_path, "a", newline="") as f:
+            if new:
+                f.write("ticker,strike,replica," + ",".join(FEEDS) + "\n")
+            f.write(f"{mkt.ticker},{strike:.2f},{ours:.2f},"
+                    + ",".join(f"{feeds[n]:.2f}" if n in feeds else "" for n in FEEDS) + "\n")
+
+    def _record_results(self, now: float):
+        """Log how every watched window resolved, traded or not."""
+        if not self._awaiting_result or now - self._result_poll < 5:
+            return
+        self._result_poll = now
+        mkt = self._awaiting_result[0]
+        if now - mkt.close_ts > 600:                # give up on a window that never resolves
+            self._awaiting_result.pop(0)
+            return
+        m = self.kalshi.market(mkt.ticker)
+        if m.result in ("yes", "no"):
+            self._awaiting_result.pop(0)
+            new = not os.path.exists(self.windows_path)
+            with open(self.windows_path, "a", newline="") as f:
+                if new:
+                    f.write("ticker,open_ts,close_ts,strike,result\n")
+                f.write(f"{m.ticker},{m.open_ts:.0f},{m.close_ts:.0f},{m.strike or ''},{m.result}\n")
+
     # ----- main loop ------------------------------------------------------ #
 
     def run(self):
@@ -460,12 +592,17 @@ class Bot:
                 break
             self.clock.sleep(max(0.0, cfg.poll - (self.clock.time() - t0)))
         self._save()
+        if self._ticks_file:
+            self._ticks_file.close()
+            self._ticks_file = None
         self.out("")
         self.out(self.summary())
 
     def tick(self, now: float):
         spot = self.spot.price(now)          # sampled every tick: the history feeds the basis estimate
         self._settle_closed(now)
+        if not self.cfg.no_record:
+            self._record_results(now)
         mkt = self._current_market(now)
         if mkt is None:
             if now - self._last_status >= 30:
@@ -474,6 +611,8 @@ class Bot:
             return
         book = self.kalshi.orderbook(mkt.ticker)
         sig = self._signal(mkt, book, spot, now)
+        if sig:
+            self._record_tick(now, mkt, book, sig)
         pos = self.positions.get(mkt.ticker)
         if pos:
             self._manage(pos, mkt, book, now)
@@ -485,16 +624,17 @@ class Bot:
 
     def _current_market(self, now: float) -> Market | None:
         m = self.market
-        if m and m.close_ts - now > 1 and now - self._markets_at < 60:
-            return m
-        if not m and now - self._markets_at < 3:
+        if m and m.close_ts - now > 1:
+            return m                               # a window's market never changes mid-window
+        if now - self._markets_at < 3:
             return None
         self._markets_at = now
-        live = [x for x in self.kalshi.open_markets(self.cfg.series)
+        live = [x for x in self.kalshi.current_markets(self.cfg.series, now)
                 if x.open_ts <= now < x.close_ts - 1]
         new = min(live, key=lambda x: x.close_ts) if live else None
-        if new and (not m or new.ticker != m.ticker):
+        if new:
             self.log(f"--- window {new.ticker}  closes {hhmmss(new.close_ts)} UTC  {new.title}")
+            self._awaiting_result.append(new)
         self.market = new
         return new
 
@@ -517,9 +657,9 @@ class Bot:
 
     def _strike(self, mkt: Market, now: float) -> tuple[float | None, float]:
         """(strike, basis). The strike is the index's 60-second average just before
-        the window opened. Kalshi settles on the CF Benchmarks index while we watch
-        Coinbase, so `basis` = strike minus OUR average over that same minute, and the
-        model compares like with like. That needs the bot to have been watching at the
+        the window opened. `basis` = strike minus OUR replica's average over that same
+        minute: whatever small gap is left between the replica and the real index, so
+        the model compares like with like. That needs the bot to have been watching at the
         open, so a window joined part-way through is observed but not traded."""
         if mkt.ticker in self._strike_cache:
             return self._strike_cache[mkt.ticker]
@@ -529,22 +669,23 @@ class Bot:
                 self._strike_note = mkt.ticker
                 self.log("    joined this window part-way through: watching only, trading starts next window")
             return (None, 0.0)
-        if not mkt.strike_live:
-            # The market list is cached for ~15s and the strike is only set moments
-            # after the open, so read it from the live single-market endpoint.
-            if now - self._strike_poll < 2:
-                return (None, 0.0)
-            self._strike_poll = now
-            mkt.strike = self.kalshi.market(mkt.ticker).strike
-            mkt.strike_live = bool(mkt.strike) or now - mkt.open_ts > 30
-            if not mkt.strike_live:
+        if not mkt.strike and now - mkt.open_ts <= 30:
+            # The strike is published a few seconds after the open: ask again.
+            if now - self._strike_poll >= 3:
+                self._strike_poll = now
+                for x in self.kalshi.current_markets(self.cfg.series, now):
+                    if x.ticker == mkt.ticker:
+                        mkt.strike = x.strike
+            if not mkt.strike:
                 return (None, 0.0)
         strike = mkt.strike or ours                      # series with no published strike: spot at the open
         basis = strike - ours
         if abs(basis) > 0.003 * ours:                    # a gap that large means bad data, not basis
             basis = 0.0
         self._strike_cache = {mkt.ticker: (strike, basis)}
-        self.log(f"    strike {strike:,.2f}   index-vs-Coinbase basis {basis:+,.2f}")
+        self.log(f"    strike {strike:,.2f}   our index replica read {ours:,.2f} ({basis:+,.2f})"
+                 f" from {len(self.spot.live)} exchange(s): {' '.join(self.spot.live)}")
+        self._record_basis(mkt, strike, ours)
         return strike, basis
 
     # ----- entries -------------------------------------------------------- #
@@ -751,7 +892,11 @@ def parse_args(argv=None):
         description="Kalshi paper scalper: live prices, simulated fills, no real orders.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--series", default="KXBTC15M", help="Kalshi series ticker to trade")
-    ap.add_argument("--spot", default=None, help="Coinbase product for the spot price (default: by series)")
+    ap.add_argument("--asset", default=None, help="underlying asset, e.g. BTC (default: from the series)")
+    ap.add_argument("--feeds", default=",".join(FEEDS),
+                    help="exchanges blended into the index replica")
+    ap.add_argument("--no-record", action="store_true",
+                    help="do not write the per-second research log (data/ticks.csv)")
     ap.add_argument("--bankroll", type=float, default=1000.0, help="starting paper cash, $")
     ap.add_argument("--stake", type=float, default=100.0, help="max $ committed per trade (incl. fees)")
     ap.add_argument("--band", type=float, default=8.0,
@@ -784,15 +929,19 @@ def parse_args(argv=None):
     ap.add_argument("--report", action="store_true", help="print results so far and exit")
     cfg = ap.parse_args(argv)
     cfg.series = cfg.series.upper()
-    cfg.spot = cfg.spot or SPOT_PRODUCT.get(cfg.series)
-    if not cfg.spot:
-        ap.error(f"no default spot product for {cfg.series}; pass --spot, e.g. --spot BTC-USD")
+    cfg.asset = (cfg.asset or ASSET.get(cfg.series) or "").upper()
+    if not cfg.asset:
+        ap.error(f"don't know the asset behind {cfg.series}; pass --asset, e.g. --asset BTC")
+    cfg.feeds = [f for f in cfg.feeds.lower().split(",") if f]
+    unknown = [f for f in cfg.feeds if f not in FEEDS]
+    if unknown or not cfg.feeds:
+        ap.error(f"unknown feed(s) {unknown}; choose from {', '.join(FEEDS)}")
     return cfg
 
 
 def main(argv=None):
     cfg = parse_args(argv)
-    bot = Bot(cfg, Kalshi(), Spot(cfg.spot))
+    bot = Bot(cfg, Kalshi(), Spot(cfg.asset, cfg.feeds))
     if cfg.report:
         print(bot.summary())
         return
