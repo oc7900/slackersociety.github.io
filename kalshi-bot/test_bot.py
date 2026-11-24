@@ -208,6 +208,72 @@ class Model(unittest.TestCase):
         self.assertGreater(B.prob_up(100.05, 100, 0.0005, 60), B.prob_up(100.05, 100, 0.0005, 840))
 
 
+class Learning(unittest.TestCase):
+    def feed(self, learner, seconds, make):
+        """Random-walk price where next minute's move = make(clues) + noise."""
+        import math
+        import random
+        rng = random.Random(7)
+        px, drift = 60000.0, 0.0
+        plan = []                                   # the per-second drift owed over the next 60 s
+        for s in range(seconds):
+            clues = {"mom60": rng.gauss(0, 3), "lead_coinbase": rng.gauss(0, 2), "vs_avg": rng.gauss(0, 2)}
+            plan.append((s + 60, make(clues) / 60.0))
+            plan = [(end, d) for end, d in plan if end > s]
+            drift = sum(d for _, d in plan)
+            out = learner.observe(1000.0 + s, clues, px)
+            px *= math.exp((drift + rng.gauss(0, 0.4)) * 1e-4)
+        return out, clues
+
+    def test_learns_a_real_effect_and_trusts_it(self):
+        L = B.Learner()
+        self.feed(L, 9000, lambda c: 0.5 * c["lead_coinbase"])     # Coinbase leads: half its gap follows
+        w = dict(zip(L.names, L.w))
+        self.assertGreater(w["lead_coinbase"], 0.2)
+        self.assertLess(abs(w["mom60"]), 0.1)                      # the clues that do nothing stay near zero
+        self.assertGreater(L.trust(), 0.5)
+        self.assertGreater(L.observe(20000.0, {"lead_coinbase": 4.0}, 60000.0), 0)
+        self.assertIn("lead_coinbase", L.describe())
+
+    def test_learns_reversal_as_a_negative_weight(self):
+        L = B.Learner()
+        self.feed(L, 9000, lambda c: -0.4 * c["mom60"])            # moves tend to be given back
+        self.assertLess(dict(zip(L.names, L.w))["mom60"], -0.15)
+
+    def test_pure_noise_earns_no_trust(self):
+        L = B.Learner()
+        self.feed(L, 9000, lambda c: 0.0)
+        self.assertLess(L.trust(), 0.15)
+        self.assertLess(abs(L.observe(20000.0, {"mom60": 5.0, "lead_coinbase": 5.0}, 60000.0)), 0.2e-4)
+
+    def test_says_nothing_until_it_has_evidence(self):
+        L = B.Learner()
+        for s in range(600):
+            self.assertEqual(L.observe(1000.0 + s, {"mom60": 3.0}, 60000.0 + s), 0.0)
+        self.assertIn("gathering", L.describe())
+
+    def test_state_round_trip(self):
+        L = B.Learner()
+        self.feed(L, 3000, lambda c: 0.5 * c["lead_coinbase"])
+        M = B.Learner()
+        M.restore(L.state())
+        self.assertEqual(M.w, L.w)
+        self.assertEqual(M.trust(), L.trust())
+
+    def test_price_evidence(self):
+        s = B.Spot("BTC", ["coinbase", "kraken"])
+        for i in range(301):                                       # up $1/s for 4 min, then down $2/s for 1 min
+            s._ticks.append((1000.0 + i, 60000.0 + (i if i <= 240 else 240 - 2 * (i - 240))))
+        s._last = {"coinbase": (1300.0, 60125.0), "kraken": (1290.0, 60000.0)}      # kraken quote is stale
+        ev = s.evidence(1300.0)
+        self.assertLess(ev["mom10"], 0)                            # falling right now
+        self.assertGreater(ev["mom300"], 0)                        # but up over five minutes
+        self.assertLess(ev["off_high"], -15)                       # a setback from the high (60,240 -> 60,120)
+        self.assertGreater(ev["off_low"], 15)
+        self.assertGreater(ev["lead_coinbase"], 0)                 # Coinbase is quoting above the blend
+        self.assertNotIn("lead_kraken", ev)
+
+
 class Loop(unittest.TestCase):
     def run_scenario(self, yes_bid, spot_path, result, minutes=17, **over):
         clock = Clock()
@@ -313,7 +379,7 @@ class Loop(unittest.TestCase):
         k = FakeKalshi(clock, clock.t, lambda s: 50, "yes")
         spot = FakeSpot(clock, lambda t: 100_000)
         spot.momentum = lambda now, secs=60.0: 0.001
-        bot, _ = make_bot(k, spot, clock, minutes=1, max_entries=1)
+        bot, _ = make_bot(k, spot, clock, minutes=1, max_entries=1, momentum=0.2)
         bot.run()
         self.assertEqual(bot.positions["T-1"].side, "yes")
         clock = Clock()

@@ -17,8 +17,10 @@ Strategy
 --------
   1. Early in each window, while the contract still trades near 50/50, compare
      the market price with a fair-value estimate of P(up) computed from the
-     live price, the window's target (strike), the time left, recent volatility
-     and the momentum of the last minute.
+     live price, the window's target (strike), the time left and recent volatility,
+     nudged by what the bot has learned the evidence is worth: momentum, setbacks
+     from recent highs and lows, reversion, exchanges moving ahead of the others,
+     and pressure in Kalshi's own order book.
   2. If one side is cheap versus the model by more than the entry fee plus a
      margin, buy that side (an immediate-or-cancel limit order against the book).
   3. Sell the moment the bid is high enough that the sale nets a profit AFTER
@@ -303,6 +305,28 @@ class Spot:
             return 0.0
         return math.log(self._ticks[-1][1] / then[1])
 
+    def evidence(self, now: float) -> dict[str, float]:
+        """Clues about where the index goes next, all in basis points (0.01%):
+        momentum at three speeds, the setback from the recent high and low, the gap to
+        the recent average (reversion), and how far each exchange is ahead of the blend."""
+        if not self._ticks:
+            return {}
+        px = self._ticks[-1][1]
+        recent = [p for ts, p in self._ticks if now - ts <= 300]
+        ev = {
+            "mom10": self.momentum(now, 10) * 1e4,
+            "mom60": self.momentum(now, 60) * 1e4,
+            "mom300": self.momentum(now, 300) * 1e4,
+        }
+        if len(recent) >= 60:
+            ev["off_high"] = math.log(px / max(recent)) * 1e4      # <= 0: how far below the 5-min high
+            ev["off_low"] = math.log(px / min(recent)) * 1e4       # >= 0: how far above the 5-min low
+            ev["vs_avg"] = math.log(px / (sum(recent) / len(recent))) * 1e4
+        for n, (ts, mid) in self._last.items():
+            if now - ts <= self.STALE:
+                ev["lead_" + n] = (mid - self._offset[n] - px) / px * 1e4
+        return ev
+
     def feed_avgs(self, t0: float, t1: float) -> dict[str, float]:
         """Each exchange's own average over [t0, t1] (to see which tracks the index best)."""
         out = {}
@@ -428,6 +452,115 @@ def prob_up(spot: float, strike: float, sigma_1m: float, secs_left: float, drift
 
 
 # --------------------------------------------------------------------------- #
+# Learning what the evidence is worth
+# --------------------------------------------------------------------------- #
+
+EVIDENCE = (["mom10", "mom60", "mom300", "off_high", "off_low", "vs_avg"]
+            + ["lead_" + n for n in FEEDS] + ["book_tilt", "mkt_mom30"])
+
+
+class Learner:
+    """Works out, from the bot's own recordings, how much each clue says about the
+    index's move over the next minute, and how far that forecast can be trusted.
+
+    Every second the clues are stored; a minute later the move that actually
+    followed is known, and the weights are refitted (ridge regression, so weak
+    clues get weights near zero). Each forecast is also scored against what then
+    happened -- always on data the weights had not seen -- and `trust` is the share
+    of the forecast that actually showed up. The bot uses forecast x trust, so
+    clues that do not hold up are ignored automatically."""
+
+    HORIZON = 60.0        # seconds ahead being forecast
+    MIN_FIT = 1200        # matured samples before the first fit (~20 minutes)
+    MIN_SCORED = 900      # scored forecasts before any trust is given (~15 minutes more)
+    REFIT_EVERY = 300.0
+    RIDGE = 0.5
+    KEEP = 0.5 ** (1 / 21600.0)       # old evidence fades: half-life 6 hours
+    KEEP_SCORE = 0.5 ** (1 / 7200.0)  # trust adapts faster: half-life 2 hours
+
+    def __init__(self, names=EVIDENCE):
+        k = len(names)
+        self.names = list(names)
+        self.A = [[0.0] * k for _ in range(k)]
+        self.b = [0.0] * k
+        self.n = 0.0
+        self.w = [0.0] * k
+        self.fitted = False
+        self.sxy = self.sxx = 0.0
+        self.scored = 0.0
+        self._pending: deque = deque()
+        self._last_fit = 0.0
+
+    def observe(self, now: float, clues: dict[str, float], px: float) -> float:
+        """Feed this second's clues and price; returns the expected log return of the
+        index over the next minute (0 until the evidence has earned some trust)."""
+        while self._pending and now - self._pending[0][0] >= self.HORIZON:
+            ts, x0, px0, pred0 = self._pending.popleft()
+            if now - ts > self.HORIZON + 5 or px0 <= 0:
+                continue                                  # a gap in the data: unusable
+            y = math.log(px / px0) * 1e4
+            for i, xi in enumerate(x0):
+                self.b[i] = self.b[i] * self.KEEP + xi * y
+                row = self.A[i]
+                for j, xj in enumerate(x0):
+                    row[j] = row[j] * self.KEEP + xi * xj
+            self.n = self.n * self.KEEP + 1
+            if pred0 is not None:
+                self.sxy = self.sxy * self.KEEP_SCORE + pred0 * y
+                self.sxx = self.sxx * self.KEEP_SCORE + pred0 * pred0
+                self.scored = self.scored * self.KEEP_SCORE + 1
+        if self.n >= self.MIN_FIT and now - self._last_fit >= self.REFIT_EVERY:
+            self._last_fit = now
+            self.fit()
+        x = [clues.get(name, 0.0) for name in self.names]
+        pred = sum(wi * xi for wi, xi in zip(self.w, x)) if self.fitted else None
+        self._pending.append((now, x, px, pred))
+        return 0.0 if pred is None else self.trust() * pred * 1e-4
+
+    def trust(self) -> float:
+        """Share of the forecast that has actually materialised, out of sample (0..1)."""
+        if self.scored < self.MIN_SCORED or self.sxx <= 0:
+            return 0.0
+        return min(1.0, max(0.0, self.sxy / self.sxx))
+
+    def fit(self):
+        k = len(self.names)
+        m = [self.A[i][:] + [self.b[i]] for i in range(k)]
+        for i in range(k):
+            m[i][i] += self.RIDGE * self.A[i][i] + 1e-9   # shrink each weight toward zero
+        for c in range(k):                                # Gauss-Jordan with partial pivoting
+            p = max(range(c, k), key=lambda r: abs(m[r][c]))
+            if abs(m[p][c]) < 1e-12:
+                continue
+            m[c], m[p] = m[p], m[c]
+            for r in range(k):
+                if r != c and m[r][c]:
+                    f = m[r][c] / m[c][c]
+                    m[r] = [a - f * b for a, b in zip(m[r], m[c])]
+        self.w = [m[i][k] / m[i][i] if abs(m[i][i]) > 1e-12 else 0.0 for i in range(k)]
+        self.fitted = True
+
+    def describe(self) -> str:
+        if not self.fitted:
+            return f"still gathering evidence ({self.n:,.0f} of {self.MIN_FIT:,} samples before the first fit)"
+        # effect of a typical-sized reading of each clue on the forecast, in basis points
+        eff = sorted(((self.w[i] * math.sqrt(self.A[i][i] / max(self.n, 1)), n)
+                      for i, n in enumerate(self.names)), key=lambda t: -abs(t[0]))
+        top = ", ".join(f"{n} {e:+.2f}" for e, n in eff[:5] if abs(e) >= 0.005) or "nothing stands out"
+        return (f"evidence so far ({self.n:,.0f} samples), typical pull on the next minute in bp: {top}"
+                f"  | trust {self.trust() * 100:.0f}%")
+
+    def state(self) -> dict:
+        return {"names": self.names, "A": self.A, "b": self.b, "n": self.n, "w": self.w,
+                "fitted": self.fitted, "sxy": self.sxy, "sxx": self.sxx, "scored": self.scored}
+
+    def restore(self, st: dict):
+        if st.get("names") == self.names:
+            self.A, self.b, self.n, self.w = st["A"], st["b"], st["n"], st["w"]
+            self.fitted, self.sxy, self.sxx, self.scored = st["fitted"], st["sxy"], st["sxx"], st["scored"]
+
+
+# --------------------------------------------------------------------------- #
 # Bot
 # --------------------------------------------------------------------------- #
 
@@ -476,6 +609,15 @@ class Bot:
         self._strike_cache: dict[str, tuple[float, float]] = {}   # ticker -> (strike, basis)
         self._strike_poll = 0.0
         self._strike_note = ""
+        self.learner = Learner()
+        self._mids: deque[tuple[float, float]] = deque(maxlen=120)   # this window's UP price history
+        self.learner_path = os.path.join(cfg.data_dir, "learner.json")
+        if os.path.exists(self.learner_path):
+            try:
+                with open(self.learner_path) as f:
+                    self.learner.restore(json.load(f))
+            except (OSError, ValueError, KeyError):
+                pass                                     # unreadable: just start learning afresh
         self._entries: dict[str, int] = {}
         self._last_exit_ts = 0.0
         self._last_status = 0.0
@@ -534,6 +676,12 @@ class Bot:
     def log(self, msg: str):
         self.out(f"{hhmmss(self.clock.time())}  {msg}")
 
+    def _save_learner(self):
+        tmp = self.learner_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.learner.state(), f)
+        os.replace(tmp, self.learner_path)
+
     def _record_tick(self, now: float, mkt: Market, book: Book, sig: dict):
         """One row per second: what the model thought and what the market charged.
         edge_check.py reads this to test whether the model knows anything the market doesn't."""
@@ -544,14 +692,14 @@ class Bot:
             self._ticks_file = open(self.ticks_path, "a", newline="")
             if new:
                 self._ticks_file.write("ts,ticker,secs_left,strike,index,feeds,sigma_1m,model_up,"
-                                       "up_bid,up_ask,up_bid_size,up_ask_size,mom_60_bp\n")
+                                       "up_bid,up_ask,up_bid_size,up_ask_size,mom_60_bp,learned_bp\n")
         yes, no = book.yes[:1], book.no[:1]
         if not yes or not no:
             return
         self._ticks_file.write(
             f"{now:.0f},{mkt.ticker},{mkt.close_ts - now:.0f},{sig['strike']:.2f},{sig['spot']:.2f},"
             f"{len(self.spot.live)},{sig['sigma']:.6f},{sig['p_up'] * 100:.2f},"
-            f"{yes[0][0]:g},{100 - no[0][0]:g},{yes[0][1]},{no[0][1]},{sig['mom'] * 1e4:.3f}\n")
+            f"{yes[0][0]:g},{100 - no[0][0]:g},{yes[0][1]},{no[0][1]},{sig['mom'] * 1e4:.3f},{sig['learned'] * 1e4:.4f}\n")
         self._ticks_file.flush()
 
     def _record_basis(self, mkt: Market, strike: float, ours: float):
@@ -604,6 +752,7 @@ class Bot:
                 break
             self.clock.sleep(max(0.0, cfg.poll - (self.clock.time() - t0)))
         self._save()
+        self._save_learner()
         if self._ticks_file:
             self._ticks_file.close()
             self._ticks_file = None
@@ -622,7 +771,8 @@ class Bot:
                 self.log(f"no open {self.cfg.series} market right now; waiting")
             return
         book = self.kalshi.orderbook(mkt.ticker)
-        sig = self._signal(mkt, book, spot, now)
+        learned = self.learner.observe(now, self._clues(now, book), spot)
+        sig = self._signal(mkt, book, spot, now, learned)
         if sig:
             self._record_tick(now, mkt, book, sig)
         pos = self.positions.get(mkt.ticker)
@@ -646,26 +796,44 @@ class Bot:
         new = min(live, key=lambda x: x.close_ts) if live else None
         if new:
             self.log(f"--- window {new.ticker}  closes {hhmmss(new.close_ts)} UTC  {new.title}")
+            self.log("    " + self.learner.describe())
             self._awaiting_result.append(new)
+            self._mids.clear()
+            self._save_learner()
         self.market = new
         return new
 
     # ----- signal --------------------------------------------------------- #
 
-    def _signal(self, mkt: Market, book: Book, spot: float, now: float) -> dict | None:
+    def _clues(self, now: float, book: Book) -> dict[str, float]:
+        """Everything the learner weighs: price action on the exchanges plus what
+        Kalshi's own book is doing."""
+        clues = self.spot.evidence(now) if hasattr(self.spot, "evidence") else {}
+        if book.yes and book.no:
+            bid_sz, ask_sz = book.yes[0][1], book.no[0][1]
+            clues["book_tilt"] = (bid_sz - ask_sz) / (bid_sz + ask_sz)       # -1..1: buyers vs sellers of UP
+            mid = (book.yes[0][0] + 100 - book.no[0][0]) / 2
+            old = [m for ts, m in self._mids if 25 <= now - ts <= 35]
+            if old:
+                clues["mkt_mom30"] = mid - old[0]                            # UP price change, last 30s
+            self._mids.append((now, mid))
+        return clues
+
+    def _signal(self, mkt: Market, book: Book, spot: float, now: float, learned: float = 0.0) -> dict | None:
         """Model probability for each side and its edge (in cents, net of the entry fee)
         versus the price we would actually have to pay."""
         sigma = self.spot.sigma_1m(now)
         strike, basis = self._strike(mkt, now)
         if not strike:
             return None
-        # Momentum: assume a fraction (--momentum) of the last minute's move carries on.
+        # Expected further move over the next minute: whatever the learner has found
+        # the evidence to be worth, plus an optional fixed momentum assumption.
         secs_left = mkt.close_ts - now
         mom = self.spot.momentum(now, 60.0)
-        drift = self.cfg.momentum * mom * min(1.0, secs_left / 60.0)
+        drift = (learned + self.cfg.momentum * mom) * min(1.0, secs_left / 60.0)
         p_up = prob_up(spot + basis, strike, sigma, secs_left, drift)
         sig = {"spot": spot + basis, "strike": strike, "sigma": sigma, "p_up": p_up, "mom": mom,
-               "edge": {}, "fair": {}}
+               "learned": learned, "edge": {}, "fair": {}}
         for side, p in (("yes", p_up), ("no", 1 - p_up)):
             ask = book.best_ask(side)
             sig["fair"][side] = p * 100
@@ -922,9 +1090,9 @@ def parse_args(argv=None):
                     help="only enter during the first N minutes of a window")
     ap.add_argument("--min-edge", type=float, default=1.0,
                     help="required model edge in cents per contract, after the entry fee")
-    ap.add_argument("--momentum", type=float, default=0.2,
-                    help="share of the last minute's price move assumed to carry on (0 = ignore momentum, "
-                         "negative = expect it to reverse); edge_check.py estimates the right value from data")
+    ap.add_argument("--momentum", type=float, default=0.0,
+                    help="extra fixed assumption: share of the last minute's move that carries on "
+                         "(negative = reverses). Normally left at 0: the bot learns this from its own data")
     ap.add_argument("--min-profit", type=float, default=0.5,
                     help="take profit once the sale nets at least this many cents/contract after ALL fees")
     ap.add_argument("--exit", choices=["limit", "market"], default="limit",

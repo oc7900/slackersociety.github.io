@@ -22,9 +22,9 @@ per-second research log there (`ticks.csv`, `windows.csv`, `basis.csv`).
 1. **Waits for a new 15-minute window** and reads the strike (the "price to beat").
 2. **Picks a side.** Each second it estimates the fair probability that BTC
    finishes above the strike, from its own rebuild of the settlement index
-   (see below), how far that is from the strike, how much time is left, how
-   volatile the last hour was, and the momentum of the last minute (it assumes
-   a share of that move carries on; `--momentum`, default 0.2). If
+   (see below), how far that is from the strike, how much time is left and how
+   volatile the last hour was. That estimate is then nudged by the evidence it
+   has learned to trust (next section). If
    UP or DOWN is selling for less than that fair value by more than the
    entry fee plus a margin (`--min-edge`), that is the side it buys.
 3. **Only early and only near 50/50**: first 6 minutes of the window
@@ -50,13 +50,37 @@ This makes the bot's information less wrong. It does not make it better than
 the market makers': they have streaming feeds from the same exchanges, and
 these public tickers refresh only every second or so.
 
+## The evidence it weighs, and how it learns what each is worth
+
+Every second the bot notes a set of clues:
+
+- **momentum** over the last 10 seconds, 1 minute and 5 minutes;
+- **setbacks**: how far the price has pulled back from its 5-minute high, and
+  bounced off its 5-minute low;
+- **reversion**: how far it sits from its 5-minute average;
+- **the other exchanges**: how far each one is quoting ahead of, or behind, the blend;
+- **Kalshi's own book**: whether buyers or sellers are stacked at the best
+  price, and how the UP price moved in the last 30 seconds.
+
+Nobody knows in advance whether a pullback means "bounce" or "more to come",
+so the bot does not assume. A minute after each reading it sees what the index
+actually did, and it keeps refitting how much each clue was worth (weak or
+useless clues get a weight near zero; a clue that predicts reversal gets a
+negative one). Each forecast is then scored against what happened next, on data
+it had not seen, and the bot only leans on the forecast as far as that score
+justifies. It needs about 35 minutes of data before it uses any of this, keeps
+learning as it runs, and saves what it has learned in `data/learner.json`.
+
+At each new window it prints what it currently believes, for example
+`lead_coinbase +0.21, mom10 +0.08 | trust 40%`.
+
 ## Is there an edge? Measure it
 
 `python3 edge_check.py` answers that from the per-second log instead of from a
 few trades:
 
 1. how closely the rebuilt index tracks the real one (and which exchange is worst);
-2. whether momentum really carries on, and what `--momentum` value the data supports;
+2. whether momentum carries on, and how much of the bot's learned forecast actually arrived;
 3. when the model and the market disagree, which one the price then moves toward;
 4. the whole strategy replayed at every recorded second, with the side picked by
    the model versus picked blindly.
@@ -111,7 +135,7 @@ trades before drawing any conclusion.
 | `--band` | 8 | enter only within this many cents of 50¢ |
 | `--entry-window` | 6 | enter only in the first N minutes |
 | `--min-edge` | 1 | cents the model must say you are ahead, after the entry fee |
-| `--momentum` | 0.2 | share of the last minute's move assumed to continue (0 = ignore) |
+| `--momentum` | 0 | extra fixed momentum assumption on top of what is learned |
 | `--min-profit` | 0.5 | cents per contract of net profit that triggers the sale |
 | `--exit` | `limit` | `market` = hit the bid instead (pays the fee twice) |
 | `--stop-loss` | 0 (off) | cents below entry at which to bail out |

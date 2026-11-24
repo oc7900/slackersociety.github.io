@@ -64,6 +64,10 @@ def by_window(ticks: list[dict]) -> dict[str, list[dict]]:
         except (KeyError, ValueError):
             continue
         row["mid"] = (row["bid"] + row["ask"]) / 2
+        try:
+            row["learned"] = float(r.get("learned_bp") or 0)
+        except ValueError:
+            row["learned"] = 0.0
         out[r["ticker"]].append(row)
     for rows in out.values():
         rows.sort(key=lambda x: x["ts"])
@@ -73,8 +77,14 @@ def by_window(ticks: list[dict]) -> dict[str, list[dict]]:
 def momentum_check(windows: dict[str, list[dict]]):
     print("2. DOES MOMENTUM CARRY ON?")
     pairs = []                                         # (last minute's move, next minute's move)
+    learned = []                                       # (bot's learned forecast, next minute's move), in bp
     for rows in windows.values():
         at = {round(r["ts"]): r["index"] for r in rows}
+        for r in rows[::60]:
+            nxt = next((at[round(r["ts"]) + 60 + d] for d in (0, 1, -1, 2, -2)
+                        if round(r["ts"]) + 60 + d in at), None)
+            if nxt and r["learned"]:
+                learned.append((r["learned"], math.log(nxt / r["index"]) * 1e4))
 
         def near(t):
             return next((at[t + d] for d in (0, 1, -1, 2, -2) if t + d in at), None)
@@ -98,7 +108,19 @@ def momentum_check(windows: dict[str, list[dict]]):
     print(f"   the next minute went the same direction {same * 100:.0f}% of the time (50% = no momentum).")
     verdict = ("no reliable momentum either way: --momentum 0 is the honest setting" if abs(k) < 2 * se
                else f"use about --momentum {k:.2f}" + (" (moves tend to REVERSE)" if k < 0 else ""))
-    print(f"   Reading it: {verdict}.\n")
+    print(f"   Reading it: {verdict}.")
+    if len(learned) >= 30:
+        sxx = sum(x * x for x, _ in learned)
+        k = sum(x * y for x, y in learned) / sxx
+        se = math.sqrt(sum((y - k * x) ** 2 for x, y in learned) / (len(learned) - 1) / sxx)
+        print(f"   The bot's learned forecast (momentum, setbacks, reversion, exchange leads, book pressure):")
+        print(f"   of every 1bp it predicted for the next minute, {k:+.2f}bp arrived (+/-{2 * se:.2f}, "
+              f"{len(learned)} forecasts, typical size {math.sqrt(sxx / len(learned)):.2f}bp).")
+        print("   Clearly above zero = the evidence is real. A typical size well under 1bp means it is real but")
+        print("   far too small to matter: a 15-minute window moves about 10-20bp.")
+    else:
+        print(f"   The bot's learned forecast: not enough scored forecasts yet ({len(learned)}).")
+    print()
 
 
 def who_is_right(windows: dict[str, list[dict]], results: dict[str, str]):
