@@ -225,8 +225,14 @@ class Kalshi:
         time (with a fresh timestamp) bypasses the 15-second cache on the plain
         "open markets" list, which shows a new window up to 30 seconds late. It is
         a costlier call for Kalshi's rate limit, so it is only used at window changes."""
-        data = http_get(f"{self.base}/markets", {
-            "series_ticker": series, "min_close_ts": int(now), "max_close_ts": int(now) + 960, "limit": 20})
+        try:
+            data = http_get(f"{self.base}/markets", {
+                "series_ticker": series, "min_close_ts": int(now), "max_close_ts": int(now) + 960,
+                "limit": 20}, retries=0)
+        except FeedError:
+            # Rate-limited or down: the cached list costs nothing against the limit.
+            data = http_get(f"{self.base}/markets",
+                            {"series_ticker": series, "status": "open", "limit": 20}, retries=0)
         return [Market.from_api(m) for m in data.get("markets") or []]
 
     def market(self, ticker: str) -> Market:
@@ -663,6 +669,7 @@ class Bot:
         os.replace(tmp, self.state_path)
 
     def _record(self, now, ticker, action, side, qty, price_c, fee_c, pnl_c, note=""):
+        now = self.clock.time()
         new = not os.path.exists(self.trades_path)
         with open(self.trades_path, "a", newline="") as f:
             w = csv.writer(f)
@@ -721,6 +728,8 @@ class Bot:
             return
         self._result_poll = now
         mkt = self._awaiting_result[0]
+        if now < mkt.close_ts + 20:                 # not urgent: keep clear of the window change
+            return
         if now - mkt.close_ts > 600:                # give up on a window that never resolves
             self._awaiting_result.pop(0)
             return
@@ -786,13 +795,13 @@ class Bot:
 
     def _current_market(self, now: float) -> Market | None:
         m = self.market
-        if m and m.close_ts - now > 1:
+        if m and m.close_ts - now > 0:
             return m                               # a window's market never changes mid-window
         if now - self._markets_at < 3:
             return None
         self._markets_at = now
         live = [x for x in self.kalshi.current_markets(self.cfg.series, now)
-                if x.open_ts <= now < x.close_ts - 1]
+                if x.open_ts <= now < x.close_ts]
         new = min(live, key=lambda x: x.close_ts) if live else None
         if new:
             self.log(f"--- window {new.ticker}  closes {hhmmss(new.close_ts)} UTC  {new.title}")
@@ -990,8 +999,8 @@ class Bot:
     def _settle_closed(self, now: float):
         """Positions whose window has closed are paid out from Kalshi's official result."""
         for pos in list(self.positions.values()):
-            if now < pos.close_ts or now - pos.last_settle_poll < 5:
-                continue
+            if now < pos.close_ts + 4 or now - pos.last_settle_poll < 5:
+                continue                # Kalshi posts the result a few seconds after the close
             pos.last_settle_poll = now
             m = self.kalshi.market(pos.ticker)
             if m.result not in ("yes", "no"):

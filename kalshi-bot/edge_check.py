@@ -47,11 +47,11 @@ def replica_quality(rows: list[dict]):
         print(f"   only {len(rows)} window opens recorded; need a few more.\n")
         return
     print(f"   At each window open the real index value is known (it is the strike). Over {len(rows)} opens:")
-    print("   source        typical gap     wobble (std dev)   <- wobble is what hurts; a steady gap is corrected for")
+    print("   source       sits above index by   wobble (std dev)   <- wobble is what hurts; a steady gap is corrected for")
     for col in [c for c in rows[0] if c not in ("ticker", "strike")]:
-        gaps = [float(r["strike"]) - float(r[col]) for r in rows if r.get(col)]
+        gaps = [float(r[col]) - float(r["strike"]) for r in rows if r.get(col)]
         if len(gaps) >= 3:
-            print(f"   {col:<12} {mean(gaps):>+9.2f}      {statistics.pstdev(gaps):>9.2f}       ({len(gaps)} opens)")
+            print(f"   {col:<12} {mean(gaps):>+12.2f}        {statistics.pstdev(gaps):>9.2f}       ({len(gaps)} opens)")
     print()
 
 
@@ -239,7 +239,8 @@ def main():
     ticks = load(os.path.join(a.data_dir, "ticks.csv"))
     results = {r["ticker"]: r["result"] for r in load(os.path.join(a.data_dir, "windows.csv"))}
     windows = by_window(ticks)
-    print(f"{len(ticks):,} seconds recorded across {len(windows)} windows, {len(results)} resolved.\n")
+    done = len([t for t in windows if results.get(t) in ("yes", "no")])
+    print(f"{len(ticks):,} seconds recorded across {len(windows)} windows, {done} of them resolved.\n")
     replica_quality(load(os.path.join(a.data_dir, "basis.csv")))
     if not ticks:
         print("No tick data yet: run bot.py for a while first.")
