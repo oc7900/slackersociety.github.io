@@ -15,16 +15,16 @@ no real orders -- but fills are simulated against the real order book:
 
 Strategy
 --------
-  1. Early in each window, while the contract still trades near 50/50, compare
-     the market price with a fair-value estimate of P(up) computed from the
-     live price, the window's target (strike), the time left and recent volatility,
+  1. Early in each window, look at the side Kalshi prices at 20-40c (the underdog)
+     and estimate what it is really worth: a fair-value probability from the live
+     price, the window's target (strike), the time left and recent volatility,
      nudged by what the bot has learned the evidence is worth: momentum, setbacks
      from recent highs and lows, reversion, exchanges moving ahead of the others,
      and pressure in Kalshi's own order book.
-  2. If one side is cheap versus the model by more than the entry fee plus a
-     margin, buy that side (an immediate-or-cancel limit order against the book).
-  3. Sell the moment the bid is high enough that the sale nets a profit AFTER
-     both fees. Otherwise hold to settlement (or use --stop-loss).
+  2. If that side is cheap versus the estimate by more than the entry fee plus a
+     margin, buy it (an immediate-or-cancel limit order against the book).
+  3. Sell the moment the price is high enough that the sale nets a profit after
+     all fees. Otherwise hold to settlement (or use --stop-loss).
   4. Repeat, window after window.
 
 Python 3.9+, standard library only.   python3 bot.py --help
@@ -893,16 +893,23 @@ class Bot:
         budget = min(cfg.stake * 100.0, self.cash_c)
         if budget < 100:
             return
-        side = max(("yes", "no"), key=lambda s: sig["edge"][s] if sig["edge"][s] is not None else -1e9)
-        edge, ask, bid = sig["edge"][side], book.best_ask(side), book.best_bid(side)
-        if edge is None or ask is None or bid is None:
+        # Only the side Kalshi currently prices inside the chosen range (by default the
+        # 20-40c underdog) is a candidate, and only if the model thinks it is worth more
+        # than it costs after the entry fee.
+        picks = []
+        for side in ("yes", "no"):
+            edge, ask, bid = sig["edge"][side], book.best_ask(side), book.best_bid(side)
+            if (edge is not None and ask is not None and bid is not None
+                    and cfg.min_price <= ask <= cfg.max_price
+                    and ask - bid <= cfg.max_spread and edge >= cfg.min_edge):
+                picks.append((edge, side, ask))
+        if not picks:
             return
-        if abs(ask - 50) > cfg.band or ask - bid > cfg.max_spread or edge < cfg.min_edge:
-            return
+        edge, side, ask = max(picks)
 
         # Decision made. A real order takes time to reach the exchange, so wait
         # out the latency and fill against a FRESH book, as a limit order.
-        limit = min(ask + cfg.slippage, 50 + cfg.band)
+        limit = min(ask + cfg.slippage, cfg.max_price)
         self.clock.sleep(cfg.latency_ms / 1000.0)
         fresh = self.kalshi.orderbook(mkt.ticker)
         fills = sim_buy(fresh, side, budget, limit, self.rate)
@@ -1093,8 +1100,10 @@ def parse_args(argv=None):
                     help="do not write the per-second research log (data/ticks.csv)")
     ap.add_argument("--bankroll", type=float, default=1000.0, help="starting paper cash, $")
     ap.add_argument("--stake", type=float, default=100.0, help="max $ committed per trade (incl. fees)")
-    ap.add_argument("--band", type=float, default=8.0,
-                    help="only enter while the price is within this many cents of 50")
+    ap.add_argument("--min-price", type=float, default=20.0,
+                    help="only buy a side Kalshi prices at or above this many cents")
+    ap.add_argument("--max-price", type=float, default=40.0,
+                    help="...and at or below this many cents (20-40 = the underdog side; 42-58 = near 50/50)")
     ap.add_argument("--entry-window", type=float, default=6.0,
                     help="only enter during the first N minutes of a window")
     ap.add_argument("--min-edge", type=float, default=1.0,

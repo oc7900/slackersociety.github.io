@@ -27,8 +27,10 @@ per-second research log there (`ticks.csv`, `windows.csv`, `basis.csv`).
    has learned to trust (next section). If
    UP or DOWN is selling for less than that fair value by more than the
    entry fee plus a margin (`--min-edge`), that is the side it buys.
-3. **Only early and only near 50/50**: first 6 minutes of the window
-   (`--entry-window`), price within 8¢ of 50¢ (`--band`).
+3. **Only early, and only the 20-40¢ side.** In the first 6 minutes of the
+   window (`--entry-window`) it looks at whichever side Kalshi prices between
+   20¢ and 40¢ (`--min-price`, `--max-price`): the underdog. It buys only if its
+   own estimate says that side is worth more than it costs.
 4. **Sells the instant it is in profit.** From the moment it buys, a sell order
    rests at the lowest price that is a profit after all fees (`--min-profit`,
    default ½¢ per contract). When the market reaches it, it is out.
@@ -109,15 +111,18 @@ wins), and your own orders would move the market slightly at larger sizes.
 "More than a 50% chance of being in profit at some point" is true, and it is not
 enough. What matters is the win rate **versus the size of a win and a loss**:
 
-- Buy 189 contracts at 51¢ ($100). The fee is $3.36, so the cost is 52.8¢ each.
-- The first profitable exit is 54¢: a winner makes about **$2.30**.
+- Buy 317 contracts at 30¢ ($100). The fee is $4.66, so the cost is 31.5¢ each.
+- The first profitable exit is 32¢: a winner makes about **$1.70**.
 - A loser held to the close loses the whole **$100**.
-- So the break-even win rate is about **97.7%**, not 50%.
+- So the break-even win rate is about **98%**, not 50%. (Across the 20-40¢
+  range it is 96-98%, depending on where the first whole-cent profit lands.)
 
-In a market that is priced fairly, a 51¢ contract touches 54¢ before the close
-about 51/54 = 94% of the time. That is a lot of small wins, and still a losing
-bot: roughly $3.40 lost per $100 trade, which is exactly the entry fee. A stop-loss
-does not fix this; it trades fewer total wipe-outs for more medium losses.
+In a market that is priced fairly, a 30¢ contract touches 32¢ before the close
+about 30/32 = 94% of the time. That is a lot of small wins, and still a losing
+bot: roughly $4.70 lost per $100 trade, which is exactly the entry fee. Cheaper
+contracts make this slightly worse, not better: the fee is a bigger share of a
+30¢ contract (4.9%) than of a 50¢ one (3.4%). A stop-loss does not fix it; it
+trades fewer total wipe-outs for more medium losses.
 
 The only thing that can make it profitable is the side-picking being genuinely
 better than the market's price. This bot's model is sensible but simple, and
@@ -132,7 +137,7 @@ trades before drawing any conclusion.
 |---|---|---|
 | `--series` | `KXBTC15M` | also `KXETH15M`, `KXSOL15M`, `KXXRP15M` |
 | `--bankroll` / `--stake` | 1000 / 100 | paper cash, and max $ per trade |
-| `--band` | 8 | enter only within this many cents of 50¢ |
+| `--min-price` / `--max-price` | 20 / 40 | only buy a side Kalshi prices in this range (42 / 58 = near 50/50) |
 | `--entry-window` | 6 | enter only in the first N minutes |
 | `--min-edge` | 1 | cents the model must say you are ahead, after the entry fee |
 | `--momentum` | 0 | extra fixed momentum assumption on top of what is learned |

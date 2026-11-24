@@ -10,7 +10,7 @@ handful of trades the bot happened to take:
   1. How well does our rebuilt index track the real one?            (basis.csv)
   2. Does momentum carry on, and how much?                          (ticks.csv)
   3. When the model disagrees with the market, who is right?        (ticks.csv)
-  4. Replaying "buy near 50/50, sell at the first profit" at EVERY
+  4. Replaying "buy the 20-40c side, sell at the first profit" at EVERY
      recorded second: does picking the side with the model beat
      picking it blindly, and does either make money after fees?     (ticks.csv + windows.csv)
 """
@@ -170,10 +170,10 @@ def who_is_right(windows: dict[str, list[dict]], results: dict[str, str]):
     print()
 
 
-def replay(windows: dict[str, list[dict]], results: dict[str, str], band: float, entry_secs: float,
+def replay(windows: dict[str, list[dict]], results: dict[str, str], lo: float, hi: float, entry_secs: float,
            min_edge: float, min_profit: float):
     print("4. REPLAYING THE STRATEGY AT EVERY RECORDED SECOND")
-    print(f"   Buy at the offer when within {band:g}c of 50 in the first {entry_secs / 60:g} min; rest a sell at the")
+    print(f"   Buy a side priced {lo:g}-{hi:g}c in the first {entry_secs / 60:g} min; rest a sell at the")
     print("   first price that is a profit after the fee; otherwise settle at Kalshi's result.")
     groups = {"model's pick": [], "the other side": [], "either side (blind)": []}
     used = set()
@@ -192,7 +192,7 @@ def replay(windows: dict[str, list[dict]], results: dict[str, str], band: float,
             for side in ("yes", "no"):
                 ask = r["ask"] if side == "yes" else 100 - r["bid"]
                 fair = r["model"] if side == "yes" else 100 - r["model"]
-                if abs(ask - 50) > band:
+                if not lo <= ask <= hi:
                     continue
                 cost = ask + fee_c(ask)
                 target = math.ceil(cost + min_profit - 1e-9)
@@ -231,7 +231,8 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default=os.path.join(here, "data"))
-    ap.add_argument("--band", type=float, default=8.0)
+    ap.add_argument("--min-price", type=float, default=20.0)
+    ap.add_argument("--max-price", type=float, default=40.0)
     ap.add_argument("--entry-window", type=float, default=6.0, help="minutes")
     ap.add_argument("--min-edge", type=float, default=1.0)
     ap.add_argument("--min-profit", type=float, default=0.5)
@@ -247,7 +248,7 @@ def main():
         return
     momentum_check(windows)
     who_is_right(windows, results)
-    replay(windows, results, a.band, a.entry_window * 60, a.min_edge, a.min_profit)
+    replay(windows, results, a.min_price, a.max_price, a.entry_window * 60, a.min_edge, a.min_profit)
 
 
 if __name__ == "__main__":

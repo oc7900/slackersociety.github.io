@@ -66,6 +66,7 @@ class FakeKalshi:
 
 def make_bot(kalshi, spot, clock, **over):
     args = ["--data-dir", tempfile.mkdtemp(), "--reset", "--status-every", "1e9"]
+    over = {"min_price": 42, "max_price": 58, **over}      # most scenarios here trade near 50c
     for k, v in over.items():
         args += ["--" + k.replace("_", "-"), str(v)]
     lines = []
@@ -390,6 +391,33 @@ class Loop(unittest.TestCase):
         bot.run()
         self.assertEqual(bot.positions, {})
 
+    def test_default_buys_only_the_20_to_40_cent_side(self):
+        def spot_at(level):                         # at the target when the window opens, then at `level`
+            return lambda t: 100_000 if t < 1_000_010 else level
+
+        def up_bid(cents):                          # 50/50 for the first seconds, then repriced
+            return lambda s: 50 if s < 15 else cents
+        common = dict(result="no", minutes=2, max_entries=1, min_price=20, max_price=40)
+        # Spot $60 under the target: the model makes UP about 37%. Kalshi sells UP at 31c.
+        bot, _ = self.run_scenario(yes_bid=up_bid(30), spot_path=spot_at(99_940), **common)
+        pos = bot.positions["T-1"]
+        self.assertEqual((pos.side, pos.entry_price), ("yes", 31))
+        # 307 contracts for $100 (cost 32.5c each with the fee); the resting sell goes in at 33c
+        self.assertEqual(pos.qty, 307)
+        self.assertEqual(bot._target(pos), 33)
+        # Same picture mirrored: DOWN is the 31c underdog and the model likes it
+        bot, _ = self.run_scenario(yes_bid=up_bid(69), spot_path=spot_at(100_060), **common)
+        self.assertEqual(bot.positions["T-1"].side, "no")
+        # UP at 31c but the model thinks it is worth only ~26c: no trade
+        bot, _ = self.run_scenario(yes_bid=up_bid(30), spot_path=spot_at(99_880), **common)
+        self.assertEqual(bot.positions, {})
+        # A 50/50 market has no side in the 20-40c range, whatever the model says
+        bot, _ = self.run_scenario(yes_bid=up_bid(50), spot_path=spot_at(100_150), **common)
+        self.assertEqual(bot.positions, {})
+        # ...nor does a 10c long shot
+        bot, _ = self.run_scenario(yes_bid=up_bid(10), spot_path=spot_at(99_940), **common)
+        self.assertEqual(bot.positions, {})
+
     def test_no_trade_without_edge_or_outside_the_entry_window(self):
         # fair coin, fairly priced: nothing to do
         bot, _ = self.run_scenario(yes_bid=lambda s: 50, spot_path=lambda t: 100_000, result="yes")
@@ -420,7 +448,8 @@ class Loop(unittest.TestCase):
         bot, _ = make_bot(k, spot, clock, minutes=2, max_entries=1)
         bot.run()
         self.assertEqual(len(bot.positions), 1)
-        args = ["--data-dir", bot.cfg.data_dir, "--minutes", "16", "--status-every", "1e9"]
+        args = ["--data-dir", bot.cfg.data_dir, "--minutes", "16", "--status-every", "1e9",
+                "--min-price", "42", "--max-price", "58"]
         bot2 = B.Bot(B.parse_args(args), k, spot, clock=clock, out=lambda *_: None)
         self.assertEqual(len(bot2.positions), 1)
         bot2.run()
