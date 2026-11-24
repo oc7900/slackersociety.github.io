@@ -456,5 +456,63 @@ class Loop(unittest.TestCase):
         self.assertEqual(bot2.closed[0]["how"], "SETTLE-WIN")
 
 
+class Backtest(unittest.TestCase):
+    """backtest.py's replay rules, on hand-made minute bars."""
+
+    def setUp(self):
+        import argparse
+        import backtest
+        self.bt = backtest
+        self.a = argparse.Namespace(min_price=20, max_price=40, entry_window=6, min_edge=1.0,
+                                    min_profit=0.5, max_spread=3)
+        self.m = {"ticker": "T", "open": 0.0, "close": 900.0, "strike": 100.0, "result": "no"}
+
+    def bars(self, up_bids, highs=None):
+        """One bar per minute; UP ask = bid + 1. `highs` = the minute's best UP bid (default: the close)."""
+        highs = highs or up_bids
+        return [{"end": 60 * (i + 1), "bid": b, "ask": b + 1, "bid_high": h, "ask_low": min(b, h) + 1}
+                for i, (b, h) in enumerate(zip(up_bids, highs))]
+
+    def test_buys_the_underdog_and_sells_at_the_first_profit(self):
+        # UP closes minute 1 at 30/31 -> buy at 31c (cost 32.5c with the fee), sell rests at 33c.
+        bars = self.bars([30, 29, 28, 30] + [25] * 11, highs=[30, 29, 28, 33] + [25] * 11)
+        pnl, won, entry = self.bt.replay_window(self.m, bars, {}, self.a, "blind", "first")
+        cost = 31 + self.bt.fee_c(31)
+        self.assertTrue(won)
+        self.assertEqual(entry, 31)
+        self.assertAlmostEqual(pnl, (33 - cost) / cost * 100)
+
+    def test_a_touch_in_the_entry_minute_itself_does_not_count(self):
+        bars = self.bars([30] + [20] * 14, highs=[39] + [20] * 14)      # spiked before we bought
+        pnl, won, _ = self.bt.replay_window(self.m, bars, {}, self.a, "blind", "first")
+        self.assertFalse(won)
+        self.assertAlmostEqual(pnl, -100.0)                              # held to the close, resolved NO
+
+    def test_unsold_winner_is_paid_a_dollar(self):
+        m = {**self.m, "result": "yes"}
+        bars = self.bars([30] * 15)
+        cost = 31 + self.bt.fee_c(31)
+        pnl, won, _ = self.bt.replay_window(m, bars, {}, self.a, "blind", "hold")
+        self.assertAlmostEqual(pnl, (100 - cost) / cost * 100)
+
+    def test_takes_the_down_side_when_that_is_the_underdog(self):
+        bars = self.bars([69, 69, 60] + [69] * 12, highs=[69, 69, 69] + [69] * 12)   # DOWN offered at 31c
+        # DOWN's bid = 100 - UP ask; UP ask dips to 61 in minute 3 -> DOWN bid 39 >= 33 target
+        bars[2]["ask_low"] = 61
+        pnl, won, entry = self.bt.replay_window(self.m, bars, {}, self.a, "blind", "first")
+        self.assertTrue(won)
+        self.assertEqual(entry, 31)
+
+    def test_no_trade_when_nothing_is_in_range_or_only_late(self):
+        self.assertIsNone(self.bt.replay_window(self.m, self.bars([50] * 15), {}, self.a, "blind", "first"))
+        late = self.bars([50] * 8 + [30] * 7)                            # in range only from minute 9
+        self.assertIsNone(self.bt.replay_window(self.m, late, {}, self.a, "blind", "first"))
+
+    def test_history_prices_parse_from_dollars_or_cents(self):
+        self.assertAlmostEqual(self.bt.cents("0.4300"), 43.0)
+        self.assertAlmostEqual(self.bt.cents(43), 43.0)
+        self.assertIsNone(self.bt.cents(None))
+
+
 if __name__ == "__main__":
     unittest.main()
