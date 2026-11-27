@@ -113,6 +113,22 @@ Recent windows download in batches. Anything older than about two months comes f
 Kalshi's archive one window at a time, so `--days 180` takes around half an hour the
 first time and is instant after that.
 
+What it found on the 180 days of BTC windows to 27 Nov 2026 (16,958 windows):
+
+- Both types are common, and at the rates an unpredictable market produces: 45% lean
+  and stay, 28% one change, 27% flip-flop, against 44 / 29 / 27 for the random walk.
+- Quiet hours tilt about 3 points toward lean and stay, busy hours 3 points toward
+  flip-flop. Real, and small.
+- No clustering. One window's lead changes against the next window's: correlation
+  -0.01, where volatility scores +0.67 on the same test.
+- From June to September the early leader won about 2.4 points more often than its
+  price said. That is roughly what the fee and spread cost, so buying it only broke
+  even (+0.4¢ ± 1.0 a contract). In October and November the gap is gone: -0.4¢ ± 1.5
+  before costs, -2.4¢ after.
+- Betting against the lean lost about 3.5¢ a contract throughout, in busy hours too.
+
+Rerun it before relying on any of this: the month-by-month table is the part that moves.
+
 ## Why the paper fills are realistic
 
 - Buys lift the real resting offers, level by level, and never take more
