@@ -8,6 +8,7 @@ book**: no account, no API key, and it never sends an order.
 python3 bot.py                 # run until Ctrl-C  ($1,000 paper bankroll, $100 per trade)
 python3 bot.py --report        # results so far
 python3 edge_check.py          # is there any edge? (measured from the recorded data)
+python3 regime_check.py        # do windows come in "lean and stay" / "flip-flop" regimes? (Kalshi's history)
 python3 bot.py --reset         # wipe saved state and start over
 python3 bot.py --help          # every setting
 python3 -m unittest            # offline tests (no network)
@@ -89,6 +90,28 @@ few trades:
 
 An edge shows up as "model's pick" clearly beating "either side (blind)" and
 being above zero. Give it at least a day of recording (about 100 windows).
+
+## Do the windows come in regimes?
+
+`python3 regime_check.py --days 60` tests one idea on Kalshi's own history (the bot does
+not need to have run): that quiet markets give "lean and stay" windows, busy markets give
+"flip-flop" windows, and that the two come in runs you could trade.
+
+It types every window from UP's price at each minute close: a side leads once it is
+priced 55¢ or more, and the lead changes when the other side gets there. Then it
+
+1. compares how often each type happens with a random walk that has nothing to predict;
+2. checks whether the mix follows the volatility of the hour before;
+3. checks whether one window's type says anything about the next;
+4. asks the question that decides whether any of it is tradeable: in each regime, does
+   the leader win as often as it is priced, before and after the fee and the spread;
+5. looks at early blow-outs (a side already 95¢+ a few minutes in);
+6. repeats 4 month by month, because a mispricing that shows in old months and not in
+   recent ones has been competed away.
+
+Recent windows download in batches. Anything older than about two months comes from
+Kalshi's archive one window at a time, so `--days 180` takes around half an hour the
+first time and is instant after that.
 
 ## Why the paper fills are realistic
 
